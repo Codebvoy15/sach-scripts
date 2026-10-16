@@ -1152,7 +1152,8 @@ def node_disk_drill(n):
     L.append("breakdown: images %.1fGi (%s images) | container logs %.1fGi | writable layers %.1fGi | emptyDir %.1fGi" % (
         (img_used or img_sum) / G, ("%d+" % len(images)) if len(images) >= 50 else len(images), tot_logs / G, tot_root / G, tot_vols / G))
     for r_, n_, b_ in sprawl[:3]:
-        L.append("version sprawl: %d versions of %s cached (%.1fGi)" % (n_, r_.split("/")[-1] if len(r_) > 60 else r_, b_ / G))
+        L.append("version sprawl: %d versions of %s cached (~%.1fGi each; versions share layers, so disk use is less than %dx)" % (
+            n_, r_.split("/")[-1] if len(r_) > 60 else r_, b_ / n_ / G, n_))
     if big:
         L.append("largest images: " + ", ".join("%s %.1fGi" % ((i.get("names") or ["?"])[-1].split("@")[0][-60:], i.get("sizeBytes", 0) / G) for i in big))
     for p in pods[:5]:
@@ -1181,8 +1182,8 @@ def node_disk_drill(n):
                   "problem": ("Container images use %.0fGi (%.0f%% of used disk)%s. Kubelet (default settings) only garbage-collects images at 85%% disk, "
                               "which is where the Disk pressure alert fires, so the alert is the GC threshold being reached." % (
                                   imgs / G, 100.0 * imgs / base,
-                                  ("; %.0fGi of it is old versions of the same images (%s), i.e. every deploy pulls a new large tag" % (
-                                      spr / G, ", ".join("%dx %s" % (n_, r_.split("/")[-1]) for r_, n_, _ in sprawl[:3]))) if spr >= 0.2 * imgs else "")),
+                                  ("; many are old versions of the same images (%s), i.e. every deploy pulls a new large tag and old ones stay cached" % (
+                                      ", ".join("%dx %s ~%.1fGi" % (n_, r_.split("/")[-1], b_ / n_ / G) for r_, n_, b_ in sprawl[:3]))) if sprawl else "")),
                   "evidence": "imageFs usage and node image list; largest: %s." % ", ".join(
                       "%.1fGi" % (i.get("sizeBytes", 0) / G) for i in big),
                   "yaml": "# EC2NodeClass / launch template: raise root volume, e.g.\nblockDeviceMappings:\n- deviceName: /dev/xvda\n  ebs: {volumeSize: 150Gi, volumeType: gp3}\n"
@@ -1311,7 +1312,8 @@ def capacity(a):
             ("Prometheus", r"prometheus", "set --storage.tsdb.retention.size (e.g. 85% of the PVC) as well as retention.time"),
             ("ClickHouse", r"clickhouse", "add TTL clauses to the large tables (ALTER TABLE ... MODIFY TTL ...)"),
             ("SigNoz", r"signoz|chi-sig", "set SigNoz retention for traces/logs/metrics (Settings > General) - it is ClickHouse underneath"),
-            ("Kafka", r"kafka", "set log.retention.bytes / log.retention.hours per topic")]
+            ("Kafka", r"kafka", "set log.retention.bytes / log.retention.hours per topic"),
+            ("OpenObserve", r"openobserve", "set ZO_COMPACT_DATA_RETENTION_DAYS (data retention) for the streams")]
     pat = defaultdict(list)
     for p in pvcs:
         i = p.get("info") or {}
@@ -1340,7 +1342,11 @@ def capacity(a):
     L += ["", "", "ROOT CAUSE PER AT-RISK NODE (top %d)" % len(drill), "=" * 110]
     msgs = []
     for n, (lines, F) in zip(drill, res):
-        L += ["", "[%s] %s / %s  used %.0f%%, full in %s" % (n["sev"], n["cluster"], n["node"], n["cur"], eta_s(n["cur"], n["eta"]))]
+        hdr = "[%s] %s / %s  used %.0f%%, full in %s" % (n["sev"], n["cluster"], n["node"], n["cur"], eta_s(n["cur"], n["eta"]))
+        if any("Container images use" in f["problem"] for f in F) and n["eta"] is not None and n["cur"] < 85:
+            hdr = "[%s] %s / %s  used %.0f%%, hits 85%% (Disk pressure alert + kubelet image cleanup) in %s" % (
+                n["sev"], n["cluster"], n["node"], n["cur"], fmt_eta(n["eta"] * (85 - n["cur"]) / max(100 - n["cur"], 1)))
+        L += ["", hdr]
         L += ["  " + l for l in lines]
         for f in F:
             L.append("  WHY: %s  (owner: %s)" % (f["problem"], f["owner"]))
