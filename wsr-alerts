@@ -1400,6 +1400,8 @@ def pv(rows, keys):
     out = []
     for x in rows:
         m = x["metric"]
+        if "kube_namespace_name" in keys and not m.get("kube_namespace_name"):
+            continue
         try:
             v = float(x["value"][1])
         except (KeyError, ValueError):
@@ -1432,8 +1434,9 @@ def s(metric, sel="", by=PK):
     kube-state-metrics requests/limits: Running pods only (completed Job pods keep their request series)."""
     m = _sel(metric, sel)
     if metric.startswith("kube_pod_container_resource"):
-        return ("(sum by (%s) (%s) and on (%s) (max by (%s) (kube_pod_status_phase{phase=\"Running\"%s}) == 1))"
-                % (by, m, RUN_ON, RUN_ON, ("," + sel) if sel else ""))
+        # "running" = Sysdig reports live usage for the pod right now (same labels on both sides; completed Job pods drop out)
+        return ("(sum by (%s) (%s) and on (%s) (max by (%s) (sysdig_container_memory_used_bytes%s)))"
+                % (by, m, RUN_ON, RUN_ON, ("{%s}" % sel) if sel else ""))
     return "sum by (%s) (max by (%s, container_name) (%s))" % (by, by, m)
 
 def s_fn(fn, metric, rng, sel="", by=PK):
@@ -1452,11 +1455,12 @@ def memory_scan(cf):
                      % (PK, ("{%s}" % sel) if sel else "", ("{%s}" % sel) if sel else "")), keys), keys)
     lim = kmap(pv(pq(s(L_MEM, sel)), keys), keys)
     peak = kmap(pv(pq("max by (%s) (max_over_time(%s[24h]))" % (PK, ("%s{%s}" % (U_MEM, sel)) if sel else U_MEM)), keys), keys)
+    lim_raw = kmap(pv(pq("sum by (%s) (%s)" % (PK, _sel(L_MEM, sel))), keys), keys)   # crash-looping pods may report no usage right now
     R["oom"] = []
     for o in oom:
         k = tuple(o[x] for x in keys)
         if rst.get(k, 0) >= 1:
-            R["oom"].append(dict(o, restarts=rst.get(k, 0), limit=lim.get(k), peak=peak.get(k)))
+            R["oom"].append(dict(o, restarts=rst.get(k, 0), limit=lim_raw.get(k) or lim.get(k), peak=peak.get(k)))
     R["oom"].sort(key=lambda r: -r["restarts"])
     # 2. predicted OOM: near limit, steadily growing, pod older than 24h
     use = s(U_MEM, sel); l_ = s(L_MEM, sel)
@@ -1477,7 +1481,8 @@ def memory_scan(cf):
             R["atlim"].append(r)
     # 3. far above request (overcommit offenders)
     hog = "topk(25, (%s / (%s > 1048576)) > 2 and on (%s) (%s > 1073741824))" % (use, s(R_MEM, sel), PK, use)
-    R["noreq"] = pv(pq("topk(15, (%s > 2147483648) unless on (%s) (%s > 1048576))" % (use, PK, s(R_MEM, sel))), keys)
+    R["noreq"] = [r for r in pv(pq("topk(30, (%s > 2147483648) unless on (%s) (%s > 1048576))" % (use, PK, s(R_MEM, sel))), keys)
+                  if not BATCH_WL.search(r["kube_workload_name"] or r["kube_pod_name"])][:15]
     R["hog"] = pv(pq(hog), keys)
     req = kmap(pv(pq(s(R_MEM, sel)), keys), keys) if R["hog"] else {}
     curu = kmap(pv(pq(use), keys), keys) if R["hog"] else {}
@@ -1519,7 +1524,8 @@ def cpu_scan(cf):
     use = s_fn("avg_over_time", U_CPU, "1h", sel)
     req = s(R_CPU, sel)
     R["under"] = pv(pq("topk(25, (%s / (%s > 0.01)) > 2 and on (%s) (%s > 0.5))" % (use, req, PK, use)), keys)
-    R["noreq_cpu"] = pv(pq("topk(15, (%s > 1) unless on (%s) (%s > 0.01))" % (use, PK, req)), keys)
+    R["noreq_cpu"] = [r for r in pv(pq("topk(30, (%s > 1) unless on (%s) (%s > 0.01))" % (use, PK, req)), keys)
+                      if not BATCH_WL.search(r["kube_workload_name"] or r["kube_pod_name"])][:15]
     u_m = kmap(pv(pq(use), keys), keys) if R["under"] else {}
     r_m = kmap(pv(pq(req), keys), keys) if R["under"] else {}
     for r in R["under"]:
