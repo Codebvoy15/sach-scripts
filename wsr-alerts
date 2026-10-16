@@ -1,0 +1,1051 @@
+#!/usr/bin/env python3
+"""
+wsr-alerts - Sysdig Monitor alert automation for the weekly WSR + repeat-alert drill-downs.
+Python 3.6+, stdlib only. Reads SYSDIG_URL / SYSDIG_TOKEN (Monitor token) from env or ~/.sysdig_env.
+
+  wsr-alerts weekly [--start YYYY-MM-DD --end YYYY-MM-DD] [--mail-to you@pfizer.com] [--pdks-only]
+      Sat-Fri alert summary in deck format: totals, per type, top clusters, 8-week trend, repeat offenders.
+  wsr-alerts watch [--mail-to you@pfizer.com] [--threshold 3 --window-hours 24 --cooldown-hours 12]
+      Finds alerts repeating on the same cluster/node, runs a kubectl drill-down and emails root-cause evidence.
+  wsr-alerts analyze [--days 7] [--mail-to you@pfizer.com] [--all-alerts]
+      Root-cause report for every alert that repeated (>=3) in the window: pattern (PERSISTENT / SCHEDULED /
+      INTERMITTENT / ONE-OFF), why, owner, evidence, and a ready-to-send message + YAML fix per app team.
+      Saved under ~/sysdig-data/reports/ (msg-*.txt = one forwardable message each).
+  wsr-alerts drill --cluster C --node N [--alert "PDKS High CPU usage warning (>85%)"]
+      Run the drill-down by hand (prints to terminal).
+  wsr-alerts collect [--days 3]
+      Store recent notifications in the local DB (cron daily, keeps history beyond Sysdig retention).
+
+State: ~/sysdig-data/alerts.db (SQLite). Day boundaries use the jump server's timezone.
+"""
+from concurrent.futures import ThreadPoolExecutor
+import argparse, calendar, csv, json, os, re, sqlite3, subprocess, sys, time
+import urllib.error, urllib.parse, urllib.request
+from collections import Counter, defaultdict
+from datetime import date, datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+DATA = os.path.join(HOME, "sysdig-data")
+DB = os.path.join(DATA, "alerts.db")
+
+CATS = [  # (category, regex on alert name) - first match wins
+    ("CPU", r"cpu|processor load"),
+    ("Memory", r"memory"),
+    ("Disk I/O", r"disk i/o"),
+    ("Disk pressure", r"disk pressure|under disk|/var/lib/docker|out of disk|disk usage"),
+    ("Portworx", r"portworx|px pool"),
+    ("Node NotReady", r"notready|not ready"),
+    ("Pod restart/availability", r"restart|poda? available|crashloop|pod"),
+]
+
+# ---------------------------------------------------------------- helpers
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+def load_env():
+    p = os.path.join(HOME, ".sysdig_env")
+    if os.path.exists(p):
+        for line in open(p):
+            m = re.match(r"\s*(?:export\s+)?(SYSDIG_URL|SYSDIG_TOKEN|SLACK_WEBHOOK_URL)=['\"]?([^'\"\s]+)", line)
+            if m:
+                os.environ.setdefault(m.group(1), m.group(2))
+    if not (os.environ.get("SYSDIG_URL") and os.environ.get("SYSDIG_TOKEN")):
+        sys.exit("SYSDIG_URL / SYSDIG_TOKEN not set (expected in env or ~/.sysdig_env)")
+
+def category(name):
+    n = name.lower()
+    for c, rx in CATS:
+        if re.search(rx, n):
+            return c
+    return "Other"
+
+def run(cmd, timeout=120):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except Exception as e:
+        return 1, "", str(e)
+
+def day_start(d):
+    return datetime(d.year, d.month, d.day)
+
+def us(dt):
+    return int(time.mktime(dt.timetuple())) * 1000000
+
+def last_full_week(today=None):
+    today = today or date.today()
+    fri = today - timedelta(days=(today.weekday() - 4) % 7 or 7)  # most recent Friday strictly before today
+    return fri - timedelta(days=6), fri
+
+# ---------------------------------------------------------------- sysdig
+def api(params):
+    url = os.environ["SYSDIG_URL"].rstrip("/") + "/api/notifications?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["SYSDIG_TOKEN"],
+                                               "Accept": "application/json"})
+    for i in range(5):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and i < 4:
+                time.sleep(2 ** i); continue
+            sys.exit("Sysdig HTTP %s: %s" % (e.code, e.read()[:200]))
+        except urllib.error.URLError as e:
+            if i < 4:
+                time.sleep(2 ** i); continue
+            sys.exit("Sysdig unreachable: %s" % e.reason)
+
+def fetch(frm, to, limit=1000):
+    """all notifications in [frm, to) microseconds; splits the window if a page is full"""
+    d = api({"from": frm, "to": to, "limit": limit})
+    n = d.get("notifications") or []
+    if len(n) >= limit and to - frm > 60 * 1000000:
+        mid = (frm + to) // 2
+        return fetch(frm, mid, limit) + fetch(mid, to, limit)
+    return n
+
+def parse(n):
+    blob = json.dumps(n)
+    def grab(key):
+        m = re.search(re.escape(key) + r"\s*=\s*\\?['\"]([^'\"\\]+)", blob)
+        return m.group(1) if m else ""
+    cluster = (grab("agent.tag.cluster") or grab("agent_tag_cluster") or grab("kubernetes.cluster.name")
+               or grab("kube_cluster_name"))
+    host = (grab("host.hostName") or grab("kube_node_name") or grab("kubernetes.node.name")
+            or grab("host_hostname"))
+    ns = grab("kubernetes.namespace.name") or grab("kube_namespace_name")
+    value = ""
+    for e in n.get("entities") or []:
+        for mv in e.get("metricValues") or []:
+            if mv.get("value") is not None:
+                value = round(float(mv["value"]), 1); break
+        if value != "":
+            break
+    name = n.get("alertName") or n.get("name") or "?"
+    ts = int(n.get("timestamp") or 0)
+    nid = str(n.get("id") or "%s|%s|%s|%s" % (name, ts, cluster, host))
+    if not cluster:  # e.g. "sesrm-esc-prd-01 poda available alert"
+        m = re.match(r"(?:PDKS\s+)?([a-z0-9]+(?:-[a-z0-9]+){2,})\s", name)
+        cluster = m.group(1) if m else ""
+    return {"id": nid, "ts": ts, "alert": name, "cat": category(name), "cluster": cluster, "host": host,
+            "ns": ns, "value": value, "severity": n.get("severityLabel") or n.get("severity") or "",
+            "state": n.get("state") or "", "resolved": int(bool(n.get("resolved"))),
+            "condition": n.get("condition") or ""}
+
+# ---------------------------------------------------------------- db
+def db():
+    os.makedirs(DATA, exist_ok=True)
+    c = sqlite3.connect(DB)
+    c.execute("""create table if not exists notif(id text primary key, ts integer, alert text, cat text,
+                 cluster text, host text, ns text, value text, severity text, state text, resolved integer,
+                 condition text)""")
+    c.execute("create index if not exists notif_ts on notif(ts)")
+    c.execute("create table if not exists sent(key text primary key, ts integer)")
+    return c
+
+def store(c, notifs):
+    rows = [parse(n) for n in notifs]
+    c.executemany("insert or replace into notif values (:id,:ts,:alert,:cat,:cluster,:host,:ns,:value,"
+                  ":severity,:state,:resolved,:condition)", rows)
+    c.commit()
+    return len(rows)
+
+def sync(c, d0, d1):
+    """fetch [d0, d1] inclusive days from Sysdig into the db"""
+    return store(c, fetch(us(day_start(d0)), us(day_start(d1 + timedelta(days=1)))))
+
+def rows(c, d0, d1, pdks_only=False):
+    q = "select * from notif where ts >= ? and ts < ? order by ts"
+    cur = c.execute(q, (us(day_start(d0)), us(day_start(d1 + timedelta(days=1)))))
+    cols = [x[0] for x in cur.description]
+    out = [dict(zip(cols, r)) for r in cur.fetchall()]
+    if pdks_only:
+        out = [r for r in out if r["alert"].upper().startswith("PDKS")]
+    return out
+
+def slack(text):
+    """post to the Slack incoming webhook in SLACK_WEBHOOK_URL (env or ~/.sysdig_env); silently skipped if unset"""
+    url = os.environ.get("SLACK_WEBHOOK_URL")
+    if not url:
+        return None
+    data = json.dumps({"text": text[:38000]}).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            ok = r.status == 200
+    except Exception as e:
+        log("slack post failed: %s" % e)
+        return False
+    log("slack: %s" % ("posted" if ok else "FAILED"))
+    return ok
+
+def slack_summary(D, title):
+    lines = ["*%s*" % title]
+    if not D:
+        return lines[0] + "\nNo alert repeated enough to analyse."
+    for d in D:
+        lines.append("`%s` *%s* on `%s` (%dx)\n      %s  _owner: %s_" % (
+            d["pattern"], d["alert"], d["cluster"], d["count"], d["why"][:240], d["owner"]))
+    lines.append("_Full report + ready-to-send messages: emailed, and under ~/sysdig-data/reports/ on the jump server._")
+    return "\n".join(lines)
+
+def slack_detail(d):
+    out = ["`%s` *%s* on `%s` (%dx)" % (d["pattern"], d["alert"], d["cluster"], d["count"]),
+           "*Pattern:* " + d["pexp"], "*Why:* " + d["why"], "*Owner:* " + d["owner"]]
+    f = d["findings"][0] if d["findings"] else None
+    if f and f.get("yaml"):
+        out.append("*Suggested fix* (%s%s):\n```%s```" % (f["workload"], ", ns " + f["ns"] if f["ns"] else "", f["yaml"][:2500]))
+    return "\n".join(out)
+
+def mail(to, subject, body):
+    p = subprocess.Popen(["mailx", "-s", subject, to], stdin=subprocess.PIPE, universal_newlines=True)
+    p.communicate(body)
+    return p.returncode == 0
+
+# ---------------------------------------------------------------- weekly
+def top(counter, n=3):
+    return ", ".join("%s (%d)" % (k or "?", v) for k, v in counter.most_common(n))
+
+def weekly(a):
+    c = db()
+    if a.start and a.end:
+        d0, d1 = date(*map(int, a.start.split("-"))), date(*map(int, a.end.split("-")))
+    else:
+        d0, d1 = last_full_week()
+    weeks = [(d0 - timedelta(days=7 * i), d1 - timedelta(days=7 * i)) for i in range(a.trend_weeks)][::-1]
+    if not a.offline:
+        log("syncing %s -> %s from Sysdig ..." % (weeks[0][0], d1))
+        sync(c, weeks[0][0], d1)
+
+    R = rows(c, d0, d1, a.pdks_only)
+    L = []
+    L.append("WSR ALERT SUMMARY  %s - %s  (Sat-Fri, server time %s)%s" % (
+        d0.strftime("%a %d %b"), d1.strftime("%a %d %b %Y"), time.strftime("%Z"), "  [PDKS alerts only]" if a.pdks_only else ""))
+    L.append("=" * 100)
+    bycat = defaultdict(list)
+    for r in R:
+        bycat[r["cat"]].append(r)
+    L.append("Total alerts: %d   across %d clusters, %d nodes" % (
+        len(R), len({r["cluster"] for r in R if r["cluster"]}), len({(r["cluster"], r["host"]) for r in R if r["host"]})))
+    L.append("")
+    L.append("%-26s %5s  %s" % ("TYPE", "COUNT", "TOP CLUSTERS"))
+    for cat, rs in sorted(bycat.items(), key=lambda kv: -len(kv[1])):
+        L.append("%-26s %5d  %s" % (cat, len(rs), top(Counter(r["cluster"] for r in rs))))
+
+    L.append("")
+    L.append("BY ALERT NAME")
+    for name, n in Counter(r["alert"] for r in R).most_common():
+        L.append("  %4d  %s" % (n, name))
+
+    L.append("")
+    L.append("REPEAT OFFENDERS (same alert on the same node >= 3 times this week)")
+    rep = Counter((r["alert"], r["cluster"], r["host"]) for r in R if r["host"])
+    hits = [(k, v) for k, v in rep.most_common() if v >= 3]
+    if hits:
+        for (al, cl, h), v in hits[:10]:
+            vals = [r["value"] for r in R if (r["alert"], r["cluster"], r["host"]) == (al, cl, h) and r["value"] != ""]
+            peak = " peak %s" % max(float(x) for x in vals) if vals else ""
+            L.append("  %3dx  %-22s %-36s %s%s" % (v, cl, h, al, peak))
+    else:
+        L.append("  none")
+
+    L.append("")
+    L.append("REPEAT CLUSTERS (same alert on the same cluster >= 3 times this week)")
+    crep = defaultdict(list)
+    for r in R:
+        if r["cluster"]:
+            crep[(r["alert"], r["cluster"])].append(r)
+    chits = sorted(((k, v) for k, v in crep.items() if len(v) >= 3), key=lambda kv: -len(kv[1]))
+    if chits:
+        for (al, cl), rs in chits[:10]:
+            nodes = Counter(r["host"] for r in rs if r["host"])
+            L.append("  %3dx  %-22s %2d nodes  %s" % (len(rs), cl, len(nodes), al))
+            if nodes:
+                L.append("        top nodes: %s" % top(nodes, 3))
+    else:
+        L.append("  none")
+
+    L.append("")
+    L.append("TREND (last %d weeks, Sat-Fri)" % a.trend_weeks)
+    cats = [c_ for c_, _ in CATS] + ["Other"]
+    WR = [(w0, w1, rows(c, w0, w1, a.pdks_only)) for w0, w1 in weeks]
+    used = [c_ for c_ in cats if any(r["cat"] == c_ for _, _, wr in WR for r in wr)]
+    L.append("  %-14s %6s  %s" % ("WEEK", "TOTAL", "  ".join("%-8s" % u[:8] for u in used)))
+    first = c.execute("select min(ts) from notif").fetchone()[0]
+    for w0, w1, wr in WR:
+        cc = Counter(r["cat"] for r in wr)
+        if not wr and (first is None or us(day_start(w1 + timedelta(days=1))) <= first):
+            L.append("  %-14s %6s  (no data: before Sysdig retention / local history)" % (
+                w0.strftime("%d %b") + "-" + w1.strftime("%d %b"), "n/a"))
+            continue
+        L.append("  %-14s %6d  %s" % (w0.strftime("%d %b") + "-" + w1.strftime("%d %b"), len(wr),
+                                      "  ".join("%-8d" % cc[u] for u in used)))
+
+    L.append("")
+    L.append("DECK LINES")
+    for cat, rs in sorted(bycat.items(), key=lambda kv: -len(kv[1])):
+        cl = Counter(r["cluster"] for r in rs)
+        names = [k for k, _ in cl.most_common(2) if k]
+        L.append("  - %s: %d alert%s%s." % (cat, len(rs), "" if len(rs) == 1 else "s",
+                                           (", primarily on " + " and ".join(names)) if names else ""))
+    if chits:
+        (al, cl), rs = chits[0]
+        L.append("  - Most repeated: %s on %s, %d times across %d nodes; root-cause analysis in progress." % (
+            al, cl, len(rs), len({r["host"] for r in rs if r["host"]})))
+    elif hits:
+        (al, cl, h), v = hits[0]
+        L.append("  - Most repeated: %s on %s (%s), %d times; root-cause analysis in progress." % (al, cl, h, v))
+
+    out = os.path.join(DATA, "wsr-alerts_%s_%s.csv" % (d0, d1))
+    with open(out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["time", "category", "alert", "cluster", "node", "namespace", "value", "severity", "state", "resolved"])
+        for r in R:
+            w.writerow([datetime.fromtimestamp(r["ts"] / 1e6).strftime("%Y-%m-%d %H:%M"), r["cat"], r["alert"],
+                        r["cluster"], r["host"], r["ns"], r["value"], r["severity"], r["state"], r["resolved"]])
+    L.append("")
+    L.append("raw rows: " + out)
+    text = "\n".join(L)
+    print(text)
+    slack("*WSR alerts %s to %s: %d alerts*\n```%s```" % (d0, d1, len(R), text[:36000]))
+    if a.mail_to:
+        ok = mail(a.mail_to, "WSR alerts %s - %s: %d alerts" % (d0, d1, len(R)), text)
+        log("mail -> %s: %s" % (a.mail_to, "sent" if ok else "FAILED"))
+
+# ---------------------------------------------------------------- diagnosis engine
+_CTX = None
+
+def ctx_for(cluster):
+    global _CTX
+    if _CTX is None:
+        rc, out, _ = run(["kubectl", "config", "get-contexts", "-o", "name"], 30)
+        _CTX = out.split()
+    for cx in _CTX:
+        if cx == cluster or cx.endswith("/" + cluster) or cx.endswith(":" + cluster):
+            return cx
+    return None
+
+def kjson(K, args, timeout=120):
+    rc, out, err = run(K + args + ["-o", "json"], timeout)
+    if rc:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+def qty(v, kind):
+    if not v:
+        return 0.0
+    v = str(v)
+    try:
+        if kind == "cpu":
+            if v.endswith("m"): return float(v[:-1]) / 1000
+            if v.endswith("n"): return float(v[:-1]) / 1e9
+            return float(v)
+        units = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+        for u in sorted(units, key=len, reverse=True):
+            if v.endswith(u):
+                return float(v[:-len(u)]) * units[u]
+        return float(v)
+    except ValueError:
+        return 0.0
+
+def mcpu(c):   # cores -> "750m", rounded up to 50m
+    return "%dm" % max(50, int((c * 1000 + 49) // 50 * 50))
+
+def mmem(b):   # bytes -> "768Mi", rounded up to 64Mi
+    return "%dMi" % max(64, int((b / 2**20 + 63) // 64 * 64))
+
+def owner_of(p):
+    refs = p["metadata"].get("ownerReferences") or []
+    if not refs:
+        return "Pod/" + p["metadata"]["name"]
+    k, n = refs[0]["kind"], refs[0]["name"]
+    if k == "ReplicaSet":
+        return "Deployment/" + re.sub(r"-[a-z0-9]{6,10}$", "", n)
+    if k == "Job" and re.search(r"-\d{8,}$", n):
+        return "CronJob/" + re.sub(r"-\d{8,}$", "", n)
+    return k + "/" + n
+
+def threshold_of(cond):
+    m = re.search(r"(>=|>)\s*([\d.]+)", cond or "")
+    return float(m.group(2)) if m else None
+
+def k8s_time(s):
+    try:
+        return int(calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))) * 1000000
+    except (TypeError, ValueError):
+        return 0
+
+PLATFORM_NS = re.compile(r"^(artifactory|jfrog|xray|kube-|sysdig|dynatrace|portworx|karpenter|cattle|amazon-|aws-|cert-manager|ingress|istio|calico|tigera|monitoring|logging|fleet-)")
+
+def classify(ts, days, now_us, over_now=None):
+    """pattern of a group of alert timestamps -> (label, explanation)"""
+    n = len(ts)
+    dts = [datetime.fromtimestamp(t / 1e6) for t in ts]
+    days_hit = len({d.date() for d in dts})
+    hours = Counter(d.hour for d in dts)
+    bh = max(range(24), key=lambda h: hours[h] + hours[(h + 1) % 24])
+    conc = (hours[bh] + hours[(bh + 1) % 24]) / float(n) if n else 0
+    last_h = (now_us - max(ts)) / 3.6e9 if ts else 999
+    span = "%d alert%s on %d of the last %d days" % (n, "" if n == 1 else "s", days_hit, days)
+    if n >= 3 and days_hit >= 2 and conc >= 0.7:
+        return ("SCHEDULED", "%s, %d%% of them between %02d:00-%02d:00 (server time): recurs at the same time of day, "
+                "which points to a scheduled job or batch load." % (span, conc * 100, bh, (bh + 2) % 24))
+    if over_now or days_hit >= max(3, int(0.6 * days + 0.5)):
+        why = "still above the threshold right now" if over_now else "fires most days"
+        return ("PERSISTENT", "%s, %s: this is a standing capacity/sizing problem, not a one-off spike." % (span, why))
+    if n >= 2:
+        return ("INTERMITTENT", "%s, on and off at irregular times: triggered by load spikes (traffic, deploys, "
+                "restarts, batch runs) rather than a constant shortage." % span)
+    return ("ONE-OFF", "%s: isolated event; watch, no action unless it repeats." % span)
+
+# ---- evidence collectors ---------------------------------------------------
+def node_evidence(K, node, cat, thr, light=False):
+    """returns dict(lines, findings, over_now, live)"""
+    E = {"lines": [], "findings": [], "over_now": None, "live": ""}
+    L, F = E["lines"], E["findings"]
+    nj = kjson(K, ["get", "node", node], 60)
+    if not nj and not node.endswith(".internal"):
+        node = node + ".internal"
+        nj = kjson(K, ["get", "node", node], 60)
+    if not nj:
+        L.append("node %s not found (scaled down / replaced by Karpenter?): evidence only from alert history." % node)
+        return E
+    alloc = nj["status"].get("allocatable", {})
+    a_cpu, a_mem = qty(alloc.get("cpu"), "cpu"), qty(alloc.get("memory"), "mem")
+    lab = nj["metadata"].get("labels", {})
+    conds = {c_["type"]: c_["status"] for c_ in nj["status"].get("conditions", [])}
+    L.append("node %s  %s  pool=%s  %s  allocatable %.1f CPU / %.1fGi" % (
+        node, lab.get("node.kubernetes.io/instance-type", "?"),
+        lab.get("karpenter.sh/nodepool") or lab.get("eks.amazonaws.com/nodegroup") or "?",
+        lab.get("karpenter.sh/capacity-type") or lab.get("eks.amazonaws.com/capacityType") or "",
+        a_cpu, a_mem / 2**30))
+    bad = [k for k, v in conds.items() if (k == "Ready" and v != "True") or (k != "Ready" and v == "True")]
+    if bad:
+        L.append("node conditions NOT healthy: " + ", ".join(bad))
+    rc, out, _ = run(K + ["top", "node", node, "--no-headers"], 60)
+    cpu_pct = mem_pct = None
+    if not rc and out.strip():
+        f = out.split()
+        try:
+            cpu_pct, mem_pct = float(f[2].rstrip("%")), float(f[4].rstrip("%"))
+        except (IndexError, ValueError):
+            pass
+        E["live"] = "now: CPU %s (%s), memory %s (%s)" % (f[1], f[2], f[3], f[4])
+        L.append(E["live"])
+    if cat == "Disk pressure":
+        E["over_now"] = conds.get("DiskPressure") == "True"
+    if thr is not None and cat in ("CPU", "Memory"):
+        live = cpu_pct if cat == "CPU" else (mem_pct if cat == "Memory" else None)
+        if live is not None:
+            E["over_now"] = live >= thr
+    if light:
+        return E
+
+    pj = kjson(K, ["get", "pods", "-A", "--field-selector", "spec.nodeName=" + node], 120) or {"items": []}
+    usage = {}
+    for ns in sorted({p["metadata"]["namespace"] for p in pj["items"]}):
+        rc, out, _ = run(K + ["top", "pods", "-n", ns, "--no-headers"], 60)
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) >= 3:
+                usage[(ns, f[0])] = (qty(f[1], "cpu"), qty(f[2], "mem"))
+    P, s_rc, s_rm = [], 0.0, 0.0
+    for p in pj["items"]:
+        if p.get("status", {}).get("phase") not in ("Running", "Pending"):
+            continue
+        ns, name = p["metadata"]["namespace"], p["metadata"]["name"]
+        rcpu = rmem = lmem = 0.0
+        no_req = no_lim = False
+        for ct in p["spec"].get("containers", []):
+            res = ct.get("resources") or {}
+            req, lim = res.get("requests") or {}, res.get("limits") or {}
+            rcpu += qty(req.get("cpu"), "cpu"); rmem += qty(req.get("memory"), "mem"); lmem += qty(lim.get("memory"), "mem")
+            no_req |= not req.get("cpu") or not req.get("memory")
+            no_lim |= not lim.get("memory")
+        s_rc += rcpu; s_rm += rmem
+        u = usage.get((ns, name), (0.0, 0.0))
+        P.append({"ns": ns, "pod": name, "owner": owner_of(p), "rcpu": rcpu, "rmem": rmem, "lmem": lmem,
+                  "ucpu": u[0], "umem": u[1], "no_req": no_req, "no_lim": no_lim})
+    rq_c = 100 * s_rc / a_cpu if a_cpu else 0
+    rq_m = 100 * s_rm / a_mem if a_mem else 0
+    L.append("scheduled requests: CPU %.0f%% of allocatable, memory %.0f%%, %d pods" % (rq_c, rq_m, len(P)))
+
+    key = "umem" if cat == "Memory" else "ucpu"
+    tot = sum(x[key] for x in P) or 1
+    L.append("top consumers:")
+    for x in sorted(P, key=lambda x: -x[key])[:6]:
+        fl = []
+        if x["no_req"]: fl.append("NO REQUESTS")
+        if x["no_lim"] and cat == "Memory": fl.append("NO MEMORY LIMIT")
+        if x["rcpu"] and x["ucpu"] > 1.5 * x["rcpu"]: fl.append("CPU %.1fx its request" % (x["ucpu"] / x["rcpu"]))
+        if x["rmem"] and x["umem"] > 1.5 * x["rmem"]: fl.append("memory %.1fx its request" % (x["umem"] / x["rmem"]))
+        L.append("  %-25s %-40s cpu %5.2f (req %4.2f)  mem %6.0fMi (req %5.0fMi)  %s" % (
+            x["ns"][:25], x["owner"][:40], x["ucpu"], x["rcpu"], x["umem"] / 2**20, x["rmem"] / 2**20, "; ".join(fl)))
+
+    # findings
+    for x in sorted(P, key=lambda x: -x[key])[:3]:
+        share = 100 * x[key] / tot
+        if cat == "CPU" and x["ucpu"] >= 0.25 and (not x["rcpu"] or x["ucpu"] > 1.5 * x["rcpu"]):
+            F.append({"owner": "platform" if PLATFORM_NS.match(x["ns"]) else "app", "ns": x["ns"], "workload": x["owner"],
+                      "problem": "%s uses %.2f CPU cores but %s, so the scheduler packs other pods onto the same node and it runs out of CPU." % (
+                          x["owner"], x["ucpu"], "has no CPU request" if not x["rcpu"] else "only requests %.2f" % x["rcpu"]),
+                      "evidence": "%.0f%% of the node's pod CPU usage at diagnosis time." % share,
+                      "yaml": "resources:\n  requests:\n    cpu: %s\n    memory: %s\n  limits:\n    memory: %s" % (
+                          mcpu(x["ucpu"] * 1.2), mmem(max(x["umem"], x["rmem"]) * 1.1), mmem(max(x["umem"], x["rmem"]) * 1.5)),
+                      "impact": "noisy-neighbour CPU starvation and repeated High CPU alerts for every workload on that node."})
+        if cat == "Memory" and x["umem"] >= 256 * 2**20 and (not x["rmem"] or x["umem"] > 1.5 * x["rmem"]):
+            F.append({"owner": "platform" if PLATFORM_NS.match(x["ns"]) else "app", "ns": x["ns"], "workload": x["owner"],
+                      "problem": "%s uses %.0fMi of memory but requests %s%s, so the node is overcommitted on memory." % (
+                          x["owner"], x["umem"] / 2**20, "nothing" if not x["rmem"] else "%.0fMi" % (x["rmem"] / 2**20),
+                          " and has no memory limit" if x["no_lim"] else ""),
+                      "evidence": "%.0f%% of the node's pod memory usage at diagnosis time." % share,
+                      "yaml": "resources:\n  requests:\n    memory: %s\n  limits:\n    memory: %s\n# JVM: -XX:MaxRAMPercentage=75" % (
+                          mmem(x["umem"] * 1.1), mmem(x["umem"] * 1.5)),
+                      "impact": "kubelet evictions or OOM kills of this and neighbouring pods when the node fills up."})
+    if not F and cat in ("CPU", "Memory"):
+        rq = rq_c if cat == "CPU" else rq_m
+        if rq >= 85:
+            F.append({"owner": "platform", "ns": "", "workload": "node " + node,
+                      "problem": "The node is genuinely full: pod requests already reserve %.0f%% of its %s." % (rq, cat),
+                      "evidence": "no single workload is far above its request.",
+                      "yaml": "", "impact": "capacity: bigger instance type or adjust Karpenter NodePool / consolidation."})
+
+    if cat in ("Disk pressure", "Disk I/O"):
+        rc, out, _ = run(K + ["get", "--raw", "/api/v1/nodes/%s/proxy/stats/summary" % node], 60)
+        if not rc:
+            try:
+                s = json.loads(out)
+            except ValueError:
+                s = {}
+            nfs = (s.get("node") or {}).get("fs", {}) or {}
+            ifs = ((s.get("node") or {}).get("runtime") or {}).get("imageFs", {}) or {}
+            pct = lambda d: 100.0 * d.get("usedBytes", 0) / d["capacityBytes"] if d.get("capacityBytes") else 0
+            L.append("disk: root fs %.0f%% used (%.0fGi of %.0fGi), image fs %.0f%% (%.0fGi)" % (
+                pct(nfs), nfs.get("usedBytes", 0) / 2**30, nfs.get("capacityBytes", 0) / 2**30, pct(ifs), ifs.get("usedBytes", 0) / 2**30))
+            eph = sorted(((p_["podRef"]["namespace"], p_["podRef"]["name"], (p_.get("ephemeral-storage") or {}).get("usedBytes", 0))
+                          for p_ in s.get("pods", [])), key=lambda t: -t[2])[:5]
+            for ns, pn, b in eph:
+                L.append("  ephemeral %6.1fGi  %s/%s" % (b / 2**30, ns, pn))
+            used = nfs.get("usedBytes", 0) or 1
+            if eph and eph[0][2] > max(5 * 2**30, 0.3 * used):
+                ns, pn, b = eph[0]
+                F.append({"owner": "platform" if PLATFORM_NS.match(ns) else "app", "ns": ns, "workload": "pod " + pn,
+                          "problem": "Pod %s writes %.1fGi to the node's local disk (container filesystem / emptyDir / logs), filling the node." % (pn, b / 2**30),
+                          "evidence": "%.0f%% of the node disk in use is this one pod." % (100.0 * b / used),
+                          "yaml": "# write data to a PersistentVolumeClaim instead of local disk, and cap scratch space:\n"
+                                  "resources:\n  requests:\n    ephemeral-storage: 2Gi\n  limits:\n    ephemeral-storage: 4Gi\n"
+                                  "# emptyDir:\n#   sizeLimit: 4Gi",
+                          "impact": "DiskPressure on the node -> kubelet evicts pods (including other teams')."})
+            elif pct(ifs) >= 75 or pct(nfs) >= 80:
+                F.append({"owner": "platform", "ns": "", "workload": "node " + node,
+                          "problem": "Container images and node files fill the disk (root %.0f%%, images %.0f%%), not a single workload." % (pct(nfs), pct(ifs)),
+                          "evidence": "largest pod scratch usage is small compared to total disk used.", "yaml": "",
+                          "impact": "raise the EC2NodeClass/launch-template root volume size or tighten kubelet imageGC thresholds."})
+
+    rc, out, _ = run(K + ["get", "events", "-A", "--field-selector", "involvedObject.name=" + node, "--sort-by=.lastTimestamp"], 60)
+    ev = [l for l in out.splitlines()[1:] if l.strip()][-5:]
+    if ev:
+        L.append("recent node events:")
+        L.extend("  " + l[:150] for l in ev)
+    if cat == "Node NotReady":
+        F.append({"owner": "platform", "ns": "", "workload": "node " + node,
+                  "problem": "Node went NotReady; conditions/events above show kubelet, memory or network as the trigger.",
+                  "evidence": ", ".join(bad) or "node currently Ready (recovered)", "yaml": "",
+                  "impact": "pods on the node are rescheduled; check NodeClaim/EC2 health if it repeats."})
+    return E
+
+def schedule_evidence(K, ts):
+    """Jobs started shortly before alerts + CronJobs scheduled at the alert hours"""
+    lines, F = [], []
+    jj = kjson(K, ["get", "jobs", "-A"], 120) or {"items": []}
+    hits = Counter()
+    for j in jj["items"]:
+        st = k8s_time((j.get("status") or {}).get("startTime"))
+        if st and any(0 <= t - st <= 30 * 60 * 1000000 for t in ts):
+            hits[(j["metadata"]["namespace"], owner_of(j) if j["metadata"].get("ownerReferences") else "Job/" + j["metadata"]["name"])] += 1
+    utc_hours = Counter(datetime.fromtimestamp(t / 1e6, timezone.utc).hour for t in ts)
+    cj = kjson(K, ["get", "cronjobs", "-A"], 120) or {"items": []}
+    cands = []
+    for c_ in cj["items"]:
+        sch = (c_.get("spec") or {}).get("schedule", "")
+        parts = sch.split()
+        if len(parts) != 5 or parts[1] == "*":
+            continue
+        hrs = set()
+        for tok in parts[1].split(","):
+            m = re.match(r"^(\d+)(?:-(\d+))?(?:/(\d+))?$", tok)
+            m2 = re.match(r"^\*/(\d+)$", tok)
+            if m2:
+                hrs |= set(range(0, 24, int(m2.group(1))))
+            elif m:
+                a0, a1, st_ = int(m.group(1)), int(m.group(2) or m.group(1)), int(m.group(3) or 1)
+                hrs |= set(range(a0, a1 + 1, st_))
+        score = sum(v for h, v in utc_hours.items() if h in hrs or (h - 1) % 24 in hrs)
+        if score:
+            cands.append((score, c_["metadata"]["namespace"], c_["metadata"]["name"], sch))
+    if hits:
+        lines.append("jobs that started within 30 min before an alert:")
+        for (ns, w), n in hits.most_common(5):
+            lines.append("  %dx  %s/%s" % (n, ns, w))
+    if cands:
+        lines.append("cronjobs scheduled at the alert hours (UTC):")
+        for sc, ns, nm, sch in sorted(cands, reverse=True)[:5]:
+            lines.append("  %-25s %-40s '%s'  matches %d alerts" % (ns, nm, sch, sc))
+    top_hit = hits.most_common(1)[0] if hits else None
+    top_c = sorted(cands, reverse=True)[0] if cands else None
+    if top_hit or top_c:
+        ns, w = top_hit[0] if top_hit else (top_c[1], "CronJob/" + top_c[2])
+        F.append({"owner": "platform" if PLATFORM_NS.match(ns) else "app", "ns": ns, "workload": w,
+                  "problem": "%s runs at the same time the alerts fire; its batch load is the likely trigger." % w,
+                  "evidence": ("started shortly before %d alert(s)" % top_hit[1]) if top_hit else "schedule '%s' matches the alert hours" % top_c[3],
+                  "yaml": "# give the job requests that match its real usage so it lands on a node with room, and/or\n"
+                          "# move its schedule off-peak, and cap parallelism:\nspec:\n  schedule: \"<off-peak>\"\n"
+                          "  jobTemplate:\n    spec:\n      parallelism: 1",
+                  "impact": "daily alert storm at the same hour; neighbours starve while the job runs."})
+    return lines, F
+
+def pod_evidence(K, ns, since_us):
+    lines, F = [], []
+    pj = kjson(K, ["get", "pods"] + (["-n", ns] if ns else ["-A"]), 120) or {"items": []}
+    R = []
+    for p in pj["items"]:
+        for cs in (p.get("status") or {}).get("containerStatuses") or []:
+            t = ((cs.get("lastState") or {}).get("terminated")) or {}
+            if cs.get("restartCount", 0) and k8s_time(t.get("finishedAt")) >= since_us:
+                lim = ""
+                for ct in p["spec"].get("containers", []):
+                    if ct["name"] == cs["name"]:
+                        lim = ((ct.get("resources") or {}).get("limits") or {}).get("memory", "")
+                R.append((cs["restartCount"], p["metadata"]["namespace"], p["metadata"]["name"], owner_of(p), cs["name"],
+                          t.get("reason", "?"), t.get("exitCode", "?"), lim))
+    R.sort(reverse=True)
+    if not R:
+        lines.append("no containers restarted in the window%s (already stable, or pods replaced)." % (" in " + ns if ns else ""))
+        return lines, F
+    lines.append("containers restarted in the window:")
+    for rc_, pns, pn, own, cn, rsn, ec, lim in R[:8]:
+        lines.append("  %3d restarts  %-25s %-38s %-14s reason=%s exit=%s mem-limit=%s" % (rc_, pns[:25], own[:38], cn[:14], rsn, ec, lim or "none"))
+    seen = set()
+    for rc_, pns, pn, own, cn, rsn, ec, lim in R[:3]:
+        if (pns, own) in seen:
+            continue
+        seen.add((pns, own))
+        r2, logs, _ = run(K + ["logs", "-n", pns, pn, "-c", cn, "--previous", "--tail=8"], 60)
+        if logs.strip():
+            lines.append("  last log lines before the crash (%s/%s):" % (pns, pn))
+            lines.extend("    " + l[:150] for l in logs.strip().splitlines()[-8:])
+        if rsn == "OOMKilled":
+            new = mmem(qty(lim, "mem") * 1.5) if lim else "1Gi"
+            F.append({"owner": "platform" if PLATFORM_NS.match(pns) else "app", "ns": pns, "workload": own,
+                      "problem": "%s container '%s' is killed for exceeding its memory limit (%s): OOMKilled %d times." % (own, cn, lim or "none", rc_),
+                      "evidence": "lastState.terminated.reason=OOMKilled, exit code %s." % ec,
+                      "yaml": "resources:\n  requests:\n    memory: %s\n  limits:\n    memory: %s\n# or fix the leak / cap heap (JVM: -XX:MaxRAMPercentage=75)" % (
+                          mmem(qty(lim, "mem")) if lim else "512Mi", new),
+                      "impact": "service restarts and drops in-flight requests every time it hits the limit."})
+        elif str(ec) == "137":
+            F.append({"owner": "platform" if PLATFORM_NS.match(pns) else "app", "ns": pns, "workload": own,
+                      "problem": "%s container '%s' is SIGKILLed (exit 137, not OOM): usually a failing liveness probe killing a slow or hung app." % (own, cn),
+                      "evidence": "%d restarts; check 'Liveness probe failed' events in %s." % (rc_, pns),
+                      "yaml": "livenessProbe:\n  initialDelaySeconds: 60\n  timeoutSeconds: 5\n  failureThreshold: 5\n# and add a startupProbe for slow-starting apps",
+                      "impact": "restart loop under load; probe kills the app exactly when it is busiest."})
+        else:
+            F.append({"owner": "platform" if PLATFORM_NS.match(pns) else "app", "ns": pns, "workload": own,
+                      "problem": "%s container '%s' exits with reason=%s, exit code %s: an application-level crash." % (own, cn, rsn, ec),
+                      "evidence": "%d restarts; the log lines above show the error before each crash." % rc_, "yaml": "",
+                      "impact": "the app team needs to fix the startup/runtime error shown in the logs."})
+    return lines, F
+
+# ---- Sysdig metric history at alert time (works even when the node is gone) ----
+AGENT_PROCS = re.compile(r"^(dr-agent|dragent|cointerface|dr-mounted|dr-monitor|sdchecks|sysdig|falcon|kubelet|containerd|"
+                         r"dockerd|oneagent|dynatrace|instana|aws-k8s-agent|aws-node|kube-proxy|systemd|journald|fluent)", re.I)
+
+def prom(expr, t):
+    u = os.environ["SYSDIG_URL"].rstrip("/") + "/prometheus/api/v1/query?" + urllib.parse.urlencode({"query": expr, "time": int(t)})
+    req = urllib.request.Request(u, headers={"Authorization": "Bearer " + os.environ["SYSDIG_TOKEN"]})
+    for i in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read().decode()).get("data", {}).get("result", []) or []
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and i < 2:
+                time.sleep(2 ** i); continue
+            return []
+        except Exception:
+            if i < 2:
+                time.sleep(2 ** i); continue
+            return []
+    return []
+
+def pval(res):
+    try:
+        return float(res[0]["value"][1])
+    except (IndexError, KeyError, TypeError, ValueError):
+        return None
+
+def history_at(cluster, node, t, cat):
+    """what was happening on this node at alert time t (epoch seconds)"""
+    rx = re.sub(r"[^A-Za-z0-9-]", "", node.split(".")[0]) + ".*"
+    mem = cat == "Memory"
+    H = {"node_pct": None, "procs": [], "wl": [], "containers": None}
+    hm = "sysdig_host_memory_used_percent" if mem else "sysdig_host_cpu_used_percent"
+    H["node_pct"] = pval(prom('max(max_over_time(%s{host_hostname=~"%s"}[10m]))' % (hm, rx), t + 300))
+    pm = "sysdig_program_memory_used_bytes" if mem else "sysdig_program_cpu_used_percent"
+    H["procs"] = [(x["metric"].get("program_name", "?"), float(x["value"][1]))
+                  for x in prom('topk(5, sum by (program_name) (%s{host_hostname=~"%s"}))' % (pm, rx), t)]
+    cm = "sysdig_container_memory_used_bytes" if mem else "sysdig_container_cpu_cores_used"
+    for lab in ("kube_node_name", "host_hostname"):
+        r = prom('topk(5, sum by (kube_namespace_name, kube_workload_name, kube_workload_type) (%s{%s=~"%s"}))' % (cm, lab, rx), t)
+        if r:
+            H["wl"] = [(x["metric"].get("kube_namespace_name", ""), x["metric"].get("kube_workload_name", ""),
+                        x["metric"].get("kube_workload_type", ""), float(x["value"][1])) for x in r]
+            break
+    H["containers"] = pval(prom('count(%s{host_hostname=~"%s"})' % (cm, rx), t))
+    return H
+
+def requests_for(cluster, ns, wl, cat):
+    res = "memory" if cat == "Memory" else "cpu"
+    for lab in ("agent_tag_cluster", "kube_cluster_name"):
+        r = prom('max(sum by (kube_pod_name) (kube_pod_container_resource_requests{resource="%s",%s="%s",kube_namespace_name="%s",kube_workload_name="%s"}))'
+                 % (res, lab, cluster, ns, wl), time.time())
+        v = pval(r)
+        if v is not None:
+            return v
+    return None
+
+def workload_spec(K, ns, wl, kind):
+    """live spec: replicas + whether an HPA exists (best effort)"""
+    k = {"deployment": "deployment", "statefulset": "statefulset", "daemonset": "daemonset"}.get((kind or "").lower(), "deployment")
+    j = kjson(K, ["get", k, wl, "-n", ns], 60) if K else None
+    reps = (j or {}).get("spec", {}).get("replicas") if j else None
+    h = kjson(K, ["get", "hpa", "-n", ns], 60) if K else None
+    hpa = any(((x.get("spec") or {}).get("scaleTargetRef") or {}).get("name") == wl for x in (h or {}).get("items", []))
+    return reps, hpa
+
+def history_evidence(cluster, rs, cat, K, samples=6):
+    """returns (lines, findings) from Sysdig history at the most recent alert times"""
+    L, F = [], []
+    pts = sorted((r for r in rs if r["host"]), key=lambda r: -r["ts"])[:samples]
+    if not pts:
+        return L, F
+    unit = (lambda v: "%.0fMi" % (v / 2**20)) if cat == "Memory" else (lambda v: "%.2f cores" % v)
+    top_wl, top_proc, blind = Counter(), Counter(), 0
+    peak = defaultdict(float)
+    kinds = {}
+    L.append("what was running on the node AT ALERT TIME (Sysdig history):")
+    for r in pts:
+        t = r["ts"] / 1e6
+        H = history_at(cluster, r["host"], t, cat)
+        when = datetime.fromtimestamp(t).strftime("%m-%d %H:%M")
+        procs = ", ".join("%s %.0f%%" % (p, v) if cat != "Memory" else "%s %.0fMi" % (p, v / 2**20) for p, v in H["procs"][:3]) or "n/a"
+        wls = ", ".join("%s/%s %s" % (n, w, unit(v)) for n, w, k, v in H["wl"][:3]) or "none"
+        L.append("  %s  %-30s node %s  | processes: %s" % (
+            when, r["host"][:30], ("%.0f%%" % H["node_pct"]) if H["node_pct"] is not None else "n/a", procs))
+        L.append("  %s  %-30s workloads: %s" % (" " * 11, "", wls))
+        app_wl = [(n, w, k, v) for n, w, k, v in H["wl"] if not PLATFORM_NS.match(n)]
+        only_agent = H["procs"] and all(AGENT_PROCS.match(p) for p, _ in H["procs"])
+        if (H["containers"] or 0) <= 1 and only_agent:
+            blind += 1
+        if H["wl"]:
+            n, w, k, v = (app_wl or H["wl"])[0]
+            top_wl[(n, w)] += 1
+            peak[(n, w)] = max(peak[(n, w)], v)
+            kinds[(n, w)] = k
+        if H["procs"]:
+            top_proc[H["procs"][0][0]] += 1
+    N = len(pts)
+    if blind >= max(1, N // 2):
+        F.append({"owner": "platform", "ns": "sysdig-agent", "workload": "DaemonSet/pdks-shield-host",
+                  "problem": "Monitoring blind spot: at %d of %d alert times Sysdig saw only its own agent on the node (<=1 container, "
+                             "only agent processes), so the real CPU consumer is invisible." % (blind, N),
+                  "evidence": "per-process and per-container history at alert time contains only dr-agent/cointerface.",
+                  "yaml": "", "impact": "alerts on this cluster cannot be root-caused until the agent sees host processes "
+                                        "(check pdks-shield-host health, hostPID/privileged settings, and agent logs on this cluster)."})
+    if top_wl and not (blind >= max(1, N // 2) and PLATFORM_NS.match(top_wl.most_common(1)[0][0][0])):
+        (ns, wl), n = top_wl.most_common(1)[0]
+        pk = peak[(ns, wl)]
+        req = requests_for(cluster, ns, wl, cat)
+        reps, hpa = workload_spec(K, ns, wl, kinds.get((ns, wl))) if K else (None, False)
+        proc = top_proc.most_common(1)[0][0] if top_proc else ""
+        kind = {"deployment": "Deployment", "statefulset": "StatefulSet", "daemonset": "DaemonSet", "job": "Job",
+                "cronjob": "CronJob"}.get((kinds.get((ns, wl)) or "").lower(), "Deployment")
+        if cat == "Memory":
+            yaml = "resources:\n  requests:\n    memory: %s\n  limits:\n    memory: %s" % (mmem(pk * 1.1), mmem(pk * 1.4))
+            prob = "%s/%s (%s) was the top memory consumer at %d of %d alerts, peaking at %s%s." % (
+                ns, wl, kind, n, N, unit(pk), (" against a request of %s" % unit(req)) if req is not None else "")
+        else:
+            yaml = "resources:\n  requests:\n    cpu: %s" % mcpu(pk * 0.8)
+            if not hpa:
+                yaml += ("\n---\napiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: %s\n  namespace: %s\n"
+                         "spec:\n  scaleTargetRef: {apiVersion: apps/v1, kind: %s, name: %s}\n  minReplicas: %s\n  maxReplicas: %s\n"
+                         "  metrics:\n  - type: Resource\n    resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}") % (
+                             wl, ns, kind, wl, reps or 2, max(4, 2 * (reps or 2)))
+            prob = "%s/%s (%s%s) was the top CPU consumer at %d of %d alerts, using up to %s%s while the node hit its limit." % (
+                ns, wl, kind, (", process '%s'" % proc) if proc and not AGENT_PROCS.match(proc) else "", n, N, unit(pk),
+                (" with a request of only %s" % unit(req)) if req is not None and req < pk * 0.7 else
+                (" (request %s)" % unit(req) if req is not None else ""))
+        extra = []
+        if reps is not None:
+            extra.append("%s replica(s)" % reps)
+        extra.append("HPA present" if hpa else "no HPA")
+        if re.search(r"(^|-)(qa|dev|test|uat|sandbox)(-|$)", ns) and re.search(r"prod|prd", cluster):
+            extra.append("NOTE: non-prod namespace running on a prod cluster")
+        F.insert(0 if not F else 1, {
+            "owner": "platform" if PLATFORM_NS.match(ns) else "app", "ns": ns, "workload": "%s/%s" % (kind, wl),
+            "problem": prob, "evidence": "Sysdig history at %d alert times; %s." % (N, "; ".join(extra)),
+            "yaml": yaml,
+            "impact": "the node saturates whenever this workload spikes, slowing every pod on it and re-triggering the alert."})
+    return L, F
+
+# ---- one group -> report section -----------------------------------------
+def diagnose(alert, cluster, rs, days, max_nodes=2):
+    cat = category(alert)
+    ts = sorted(r["ts"] for r in rs)
+    now_us = int(time.time() * 1e6)
+    nodes = [n for n, _ in Counter(r["host"] for r in rs if r["host"]).most_common()]
+    ns = Counter(r["ns"] for r in rs if r["ns"]).most_common(1)
+    ns = ns[0][0] if ns else ""
+    thr = threshold_of(next((r["condition"] for r in rs if r["condition"]), ""))
+    vals = [float(r["value"]) for r in rs if r["value"] not in ("", None)]
+    ev, F, over = [], [], None
+    cx = ctx_for(cluster)
+    K = ["kubectl", "--context", cx] if cx else None
+    hist_ok = False
+    if cat in ("CPU", "Memory"):
+        hl, hf = history_evidence(cluster, rs, cat, K)
+        ev += hl + ([""] if hl else [])
+        F += hf
+        hist_ok = any(f["owner"] in ("app", "platform") and "top" in f["problem"] for f in hf)
+    if not cx:
+        ev.append("no kubectl context for %s on this jump server: live checks skipped." % cluster)
+    else:
+        if cat == "Pod restart/availability":
+            l2, f2 = pod_evidence(K, ns, ts[0] - 3600 * 1000000)
+            ev += l2; F += f2
+        else:
+            for nd in nodes[:1 if hist_ok else max_nodes]:
+                E = node_evidence(K, nd, cat, thr, light=hist_ok)
+                ev += E["lines"] + [""]
+                F += [f for f in E["findings"] if not any(f["workload"] == g["workload"] and f["ns"] == g["ns"] for g in F)]
+                if E["over_now"] is not None:
+                    over = bool(over) or E["over_now"]
+        pat0 = classify(ts, days, now_us, over)[0]
+        if pat0 in ("SCHEDULED", "INTERMITTENT") and cat in ("CPU", "Memory", "Disk I/O", "Disk pressure"):
+            l2, f2 = schedule_evidence(K, ts)
+            ev += l2
+            if pat0 == "SCHEDULED":
+                F = f2 + F
+            else:
+                F += f2
+    pattern, pexp = classify(ts, days, now_us, over)
+    owner = "app team" if any(f["owner"] == "app" for f in F) else ("platform team" if F else "undetermined")
+    why = F[0]["problem"] if F else {
+        "CPU": "No single workload stands out; the node runs hot from combined load. Check the node's CPU trend in Sysdig.",
+        "Memory": "No single workload stands out; combined memory usage on the node is high.",
+        "Pod restart/availability": "Pods were restarting but have since stabilised; no crash evidence left to read.",
+    }.get(cat, "Not enough live evidence; see details.")
+    head = "[%s] %s  |  %s  |  %d alerts%s" % (pattern, alert, cluster, len(ts),
+                                                "  |  peak %.1f vs threshold %s" % (max(vals), thr) if vals and thr else "")
+    S = [head, "-" * len(head),
+         "PATTERN : " + pexp,
+         "WHY     : " + why,
+         "OWNER   : " + owner,
+         "NODES   : " + (", ".join("%s (%d)" % (n, c) for n, c in Counter(r["host"] for r in rs if r["host"]).most_common(5)) or "n/a"),
+         "", "Evidence:"] + ["  " + l for l in ev if l is not None]
+    if len(F) > 1:
+        S += ["", "Other contributing factors:"] + ["  - " + f["problem"] for f in F[1:4]]
+    return {"pattern": pattern, "alert": alert, "cluster": cluster, "count": len(ts), "why": why,
+            "owner": owner, "text": "\n".join(S), "findings": F, "pexp": pexp}
+
+def app_message(d, f, days):
+    lines = ["Subject: [Action needed] %s in %s%s" % (
+                 {"CPU": "CPU pressure", "Memory": "Memory pressure", "Pod restart/availability": "Pod restarts",
+                  "Disk pressure": "Disk pressure", "Disk I/O": "Disk I/O pressure"}.get(category(d["alert"]), d["alert"]),
+                 f["ns"] or "the platform", " on " + d["cluster"]),
+             "",
+             "Hi team,",
+             "",
+             "Our monitoring raised \"%s\" %d time%s on cluster %s over the last %d days." % (
+                 d["alert"], d["count"], "" if d["count"] == 1 else "s", d["cluster"], days),
+             "Pattern: " + d["pexp"],
+             "",
+             "Root cause: " + f["problem"],
+             "Evidence: " + f["evidence"]]
+    if f["yaml"]:
+        lines += ["", "Recommended change (%s%s):" % (f["workload"], ", namespace " + f["ns"] if f["ns"] else ""), ""]
+        lines += ["    " + l for l in f["yaml"].splitlines()]
+        if "resources:" in f["yaml"]:
+            lines += ["", "Values are based on observed usage at diagnosis time; please validate against your peak load."]
+    lines += ["", "Impact if not addressed: " + f["impact"], "",
+              "Happy to help validate after the change.", "", "Regards,", "PDKS Platform Team"]
+    return "\n".join(lines)
+
+def analyze_groups(R, days, min_alerts, max_groups, max_nodes):
+    G = defaultdict(list)
+    for r in R:
+        if r["cluster"]:
+            G[(r["alert"], r["cluster"])].append(r)
+    groups = sorted(((k, v) for k, v in G.items() if len(v) >= min_alerts), key=lambda kv: -len(kv[1]))[:max_groups]
+    def one(g):
+        (al, cl), rs = g
+        log("diagnosing %s on %s (%d alerts) ..." % (al, cl, len(rs)))
+        try:
+            return diagnose(al, cl, rs, days, max_nodes)
+        except Exception as e:
+            log("  failed on %s/%s: %s" % (al, cl, e))
+            return None
+    ctx_for("")  # warm the context cache before threads start
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        out = list(ex.map(one, groups))
+    return [d for d in out if d]
+
+def render(D, days, title):
+    L = [title, "=" * 110, ""]
+    if not D:
+        return "\n".join(L + ["No alert repeated enough to analyse."])
+    L.append("%-11s %5s  %-24s %-38s %s" % ("PATTERN", "COUNT", "CLUSTER", "ALERT", "OWNER / WHY"))
+    for d in D:
+        L.append("%-11s %5d  %-24s %-38s %s: %s" % (d["pattern"], d["count"], d["cluster"][:24], d["alert"][:38],
+                                                    d["owner"], d["why"][:110]))
+    L += ["", "", "DETAILS", "=" * 110, ""]
+    for d in D:
+        L += [d["text"], "", ""]
+    msgs = [(d, f) for d in D for f in d["findings"][:1] if f["owner"] == "app"]
+    if msgs:
+        L += ["MESSAGES READY TO SEND TO APP TEAMS", "=" * 110, ""]
+        for d, f in msgs:
+            L += [app_message(d, f, days), "", "-" * 110, ""]
+    return "\n".join(L)
+
+def save_report(text, prefix, D, days):
+    rd = os.path.join(DATA, "reports")
+    os.makedirs(rd, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    p = os.path.join(rd, "%s-%s.txt" % (prefix, stamp))
+    with open(p, "w") as fh:
+        fh.write(text)
+    for d in D:
+        for f in d["findings"][:1]:
+            if f["owner"] == "app":
+                q = os.path.join(rd, "msg-%s-%s-%s-%s.txt" % (stamp, d["cluster"], f["ns"] or "platform",
+                                                             re.sub(r"[^A-Za-z0-9]+", "_", f["workload"])[:40]))
+                with open(q, "w") as fh:
+                    fh.write(app_message(d, f, days))
+    os.chmod(p, 0o600)
+    return p
+
+def select(R, all_alerts):
+    return R if all_alerts else [r for r in R if r["alert"].upper().startswith("PDKS")]
+
+def analyze(a):
+    c = db()
+    now = datetime.now()
+    since = now - timedelta(days=a.days)
+    store(c, fetch(us(since), us(now + timedelta(minutes=1))))
+    R = select([r for r in rows(c, since.date(), now.date()) if r["ts"] >= us(since)], a.all_alerts)
+    D = analyze_groups(R, a.days, a.min_alerts, a.max_groups, a.nodes)
+    text = render(D, a.days, "ALERT ROOT-CAUSE REPORT  last %d days  (%s)  %s" % (
+        a.days, now.strftime("%d %b %Y %H:%M %Z"), "" if a.all_alerts else "[PDKS alerts]"))
+    print(text)
+    p = save_report(text, "analyze", D, a.days)
+    log("\nsaved: %s  (+ one msg-*.txt per app-team message in the same folder)" % p)
+    slack(slack_summary(D, "Alert RCA, last %d day(s): %d repeating, %d need app-team action" % (
+        a.days, len(D), sum(1 for d in D if d["owner"] == "app team"))))
+    if a.mail_to:
+        ok = mail(a.mail_to, "Alert RCA (%dd): %d repeating alerts, %d need app-team action" % (
+            a.days, len(D), sum(1 for d in D if d["owner"] == "app team")), text)
+        log("mail -> %s: %s" % (a.mail_to, "sent" if ok else "FAILED"))
+
+def watch(a):
+    c = db()
+    now = datetime.now()
+    hist = now - timedelta(days=a.history_days)
+    store(c, fetch(us(hist), us(now + timedelta(minutes=1))))
+    allR = select([r for r in rows(c, hist.date(), now.date()) if r["ts"] >= us(hist)], a.all_alerts)
+    since = us(now - timedelta(hours=a.window_hours))
+    recent = Counter((r["alert"], r["cluster"]) for r in allR if r["ts"] >= since and r["cluster"])
+    hot = [k for k, n in recent.items() if n >= a.threshold]
+    fired = 0
+    for al, cl in sorted(hot, key=lambda k: -recent[k]):
+        key = "%s|%s" % (al, cl)
+        last = c.execute("select ts from sent where key=?", (key,)).fetchone()
+        if last and time.time() - last[0] < a.cooldown_hours * 3600:
+            log("cooldown: %s" % key); continue
+        log("diagnosing %s on %s (%d in %dh) ..." % (al, cl, recent[(al, cl)], a.window_hours))
+        d = diagnose(al, cl, [r for r in allR if (r["alert"], r["cluster"]) == (al, cl)], a.history_days, a.nodes)
+        text = render([d], a.history_days, "REPEATING ALERT  %s on %s  fired %d times in the last %dh" % (
+            al, cl, recent[(al, cl)], a.window_hours))
+        print(text + "\n")
+        save_report(text, "watch-" + cl, [d], a.history_days)
+        posted = slack(":rotating_light: Repeating alert (%dx in %dh)\n" % (recent[(al, cl)], a.window_hours) + slack_detail(d))
+        if posted and not a.mail_to:
+            c.execute("insert or replace into sent values (?,?)", (key, int(time.time())))
+            c.commit()
+        if a.mail_to:
+            ok = mail(a.mail_to, "[%s] %s on %s: %s" % (d["pattern"], al, cl, d["why"][:90]), text)
+            log("mail -> %s: %s" % (a.mail_to, "sent" if ok else "FAILED"))
+            c.execute("insert or replace into sent values (?,?)", (key, int(time.time())))
+            c.commit()
+        fired += 1
+    if not fired:
+        log("no repeating alerts (threshold %d in %dh)" % (a.threshold, a.window_hours))
+
+def drill_cmd(a):
+    cx = ctx_for(a.cluster)
+    if not cx:
+        sys.exit("no kubectl context for %s" % a.cluster)
+    E = node_evidence(["kubectl", "--context", cx], a.node, category(a.alert or "cpu"), None)
+    print("\n".join(E["lines"]))
+    for f in E["findings"]:
+        print("\n* " + f["problem"] + "\n  " + f["evidence"] + ("\n" + f["yaml"] if f["yaml"] else ""))
+
+# ---------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    w = sub.add_parser("weekly")
+    w.add_argument("--start"); w.add_argument("--end")
+    w.add_argument("--pdks-only", action="store_true", help="only alerts whose name starts with PDKS")
+    w.add_argument("--trend-weeks", type=int, default=8)
+    w.add_argument("--offline", action="store_true", help="use local db only, no Sysdig call")
+    w.add_argument("--mail-to")
+    an = sub.add_parser("analyze", help="root-cause report for every repeating alert in the last N days")
+    an.add_argument("--days", type=int, default=7)
+    an.add_argument("--min-alerts", type=int, default=3)
+    an.add_argument("--max-groups", type=int, default=10)
+    an.add_argument("--nodes", type=int, default=2, help="nodes to inspect per alert group")
+    an.add_argument("--all-alerts", action="store_true", help="include non-PDKS alerts (default: PDKS only)")
+    an.add_argument("--mail-to")
+    x = sub.add_parser("watch", help="near-real-time: diagnose alerts repeating in the last hours and email the RCA")
+    x.add_argument("--threshold", type=int, default=3)
+    x.add_argument("--window-hours", type=int, default=24)
+    x.add_argument("--history-days", type=int, default=7, help="history used to classify the pattern")
+    x.add_argument("--cooldown-hours", type=int, default=12)
+    x.add_argument("--nodes", type=int, default=2)
+    x.add_argument("--all-alerts", action="store_true")
+    x.add_argument("--mail-to")
+    d = sub.add_parser("drill", help="inspect one node by hand")
+    d.add_argument("--cluster", required=True); d.add_argument("--node", required=True); d.add_argument("--alert", default="")
+    co = sub.add_parser("collect")
+    co.add_argument("--days", type=int, default=3)
+    a = ap.parse_args()
+    if not a.cmd:
+        ap.print_help(); return
+    if a.cmd == "drill":
+        drill_cmd(a); return
+    load_env()
+    if a.cmd == "weekly":
+        weekly(a)
+    elif a.cmd == "watch":
+        watch(a)
+    elif a.cmd == "analyze":
+        analyze(a)
+    elif a.cmd == "collect":
+        n = sync(db(), date.today() - timedelta(days=a.days), date.today())
+        log("stored %d notifications -> %s" % (n, DB))
+
+if __name__ == "__main__":
+    main()
