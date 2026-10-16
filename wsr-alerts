@@ -11,6 +11,9 @@ Python 3.6+, stdlib only. Reads SYSDIG_URL / SYSDIG_TOKEN (Monitor token) from e
       Root-cause report for every alert that repeated (>=3) in the window: pattern (PERSISTENT / SCHEDULED /
       INTERMITTENT / ONE-OFF), why, owner, evidence, and a ready-to-send message + YAML fix per app team.
       Saved under ~/sysdig-data/reports/ (msg-*.txt = one forwardable message each).
+  wsr-alerts capacity [--cluster REGEX] [--mail-to you@pfizer.com]
+      Fleet scan of node disks, EBS PVCs and Portworx pools: usage, time-until-full (6h/24h trend), and for at-risk
+      nodes the exact disk breakdown (images vs logs vs writable layer vs emptyDir) with owner and fix.
   wsr-alerts drill --cluster C --node N [--alert "PDKS High CPU usage warning (>85%)"]
       Run the drill-down by hand (prints to terminal).
   wsr-alerts collect [--days 3]
@@ -59,10 +62,22 @@ def category(name):
             return c
     return "Other"
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def tstamp(ts, us_=True):
+    """'16 Oct 11:37 IST (02:07 EDT)' from epoch micro- or seconds"""
+    t = ts / 1e6 if us_ else ts
+    lt = time.localtime(t)
+    return "%s IST (%s %s)" % (datetime.fromtimestamp(t, IST).strftime("%d %b %H:%M"),
+                               time.strftime("%d %b %H:%M", lt), time.strftime("%Z", lt) or "server")
+
+def tz_name():
+    return time.strftime("%Z") or "server time"
+
 def run(cmd, timeout=120):
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           universal_newlines=True, timeout=timeout)
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=min(timeout, 45))
         return p.returncode, p.stdout, p.stderr
     except Exception as e:
         return 1, "", str(e)
@@ -666,17 +681,17 @@ AGENT_PROCS = re.compile(r"^(dr-agent|dragent|cointerface|dr-mounted|dr-monitor|
 def prom(expr, t):
     u = os.environ["SYSDIG_URL"].rstrip("/") + "/prometheus/api/v1/query?" + urllib.parse.urlencode({"query": expr, "time": int(t)})
     req = urllib.request.Request(u, headers={"Authorization": "Bearer " + os.environ["SYSDIG_TOKEN"]})
-    for i in range(3):
+    for i in range(2):
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=20) as r:
                 return json.loads(r.read().decode()).get("data", {}).get("result", []) or []
         except urllib.error.HTTPError as e:
-            if e.code in (429, 500, 502, 503, 504) and i < 2:
-                time.sleep(2 ** i); continue
+            if e.code in (429, 500, 502, 503, 504) and i < 1:
+                time.sleep(2); continue
             return []
         except Exception:
-            if i < 2:
-                time.sleep(2 ** i); continue
+            if i < 1:
+                time.sleep(2); continue
             return []
     return []
 
@@ -725,7 +740,7 @@ def workload_spec(K, ns, wl, kind):
     hpa = any(((x.get("spec") or {}).get("scaleTargetRef") or {}).get("name") == wl for x in (h or {}).get("items", []))
     return reps, hpa
 
-def history_evidence(cluster, rs, cat, K, samples=6):
+def history_evidence(cluster, rs, cat, K, samples=4):
     """returns (lines, findings) from Sysdig history at the most recent alert times"""
     L, F = [], []
     pts = sorted((r for r in rs if r["host"]), key=lambda r: -r["ts"])[:samples]
@@ -736,10 +751,12 @@ def history_evidence(cluster, rs, cat, K, samples=6):
     peak = defaultdict(float)
     kinds = {}
     L.append("what was running on the node AT ALERT TIME (Sysdig history):")
-    for r in pts:
+    for i_, r in enumerate(pts, 1):
         t = r["ts"] / 1e6
+        t0_ = time.time()
         H = history_at(cluster, r["host"], t, cat)
-        when = datetime.fromtimestamp(t).strftime("%m-%d %H:%M")
+        log("  [%s] history %d/%d done (%.0fs)" % (cluster, i_, len(pts), time.time() - t0_))
+        when = datetime.fromtimestamp(t, IST).strftime("%d %b %H:%M IST")
         procs = ", ".join("%s %.0f%%" % (p, v) if cat != "Memory" else "%s %.0fMi" % (p, v / 2**20) for p, v in H["procs"][:3]) or "n/a"
         wls = ", ".join("%s/%s %s" % (n, w, unit(v)) for n, w, k, v in H["wl"][:3]) or "none"
         L.append("  %s  %-30s node %s  | processes: %s" % (
@@ -854,6 +871,12 @@ def diagnose(alert, cluster, rs, days, max_nodes=2):
          "WHY     : " + why,
          "OWNER   : " + owner,
          "NODES   : " + (", ".join("%s (%d)" % (n, c) for n, c in Counter(r["host"] for r in rs if r["host"]).most_common(5)) or "n/a"),
+         "FIRST   : " + tstamp(ts[0]) + "      LAST: " + tstamp(ts[-1]),
+         "", "Alert timeline (most recent first):"] + [
+         "  %-38s %-44s %s" % (tstamp(r["ts"]), (r["host"] or r["ns"] or "-")[:44],
+                               ("value %s" % r["value"]) if r["value"] not in ("", None) else "")
+         for r in sorted(rs, key=lambda r: -r["ts"])[:15]] + (
+         ["  ... and %d earlier" % (len(rs) - 15)] if len(rs) > 15 else []) + [
          "", "Evidence:"] + ["  " + l for l in ev if l is not None]
     if len(F) > 1:
         S += ["", "Other contributing factors:"] + ["  - " + f["problem"] for f in F[1:4]]
@@ -868,9 +891,10 @@ def app_message(d, f, days):
              "",
              "Hi team,",
              "",
+             ("Our capacity monitoring found a risk on cluster %s before it turns into an outage." % d["cluster"]) if d.get("predictive") else
              "Our monitoring raised \"%s\" %d time%s on cluster %s over the last %d days." % (
                  d["alert"], d["count"], "" if d["count"] == 1 else "s", d["cluster"], days),
-             "Pattern: " + d["pexp"],
+             ("Finding: " if d.get("predictive") else "Pattern: ") + d["pexp"],
              "",
              "Root cause: " + f["problem"],
              "Evidence: " + f["evidence"]]
@@ -892,8 +916,11 @@ def analyze_groups(R, days, min_alerts, max_groups, max_nodes):
     def one(g):
         (al, cl), rs = g
         log("diagnosing %s on %s (%d alerts) ..." % (al, cl, len(rs)))
+        t0_ = time.time()
         try:
-            return diagnose(al, cl, rs, days, max_nodes)
+            d = diagnose(al, cl, rs, days, max_nodes)
+            log("  [%s] done in %.0fs" % (cl, time.time() - t0_))
+            return d
         except Exception as e:
             log("  failed on %s/%s: %s" % (al, cl, e))
             return None
@@ -947,8 +974,8 @@ def analyze(a):
     store(c, fetch(us(since), us(now + timedelta(minutes=1))))
     R = select([r for r in rows(c, since.date(), now.date()) if r["ts"] >= us(since)], a.all_alerts)
     D = analyze_groups(R, a.days, a.min_alerts, a.max_groups, a.nodes)
-    text = render(D, a.days, "ALERT ROOT-CAUSE REPORT  last %d days  (%s)  %s" % (
-        a.days, now.strftime("%d %b %Y %H:%M %Z"), "" if a.all_alerts else "[PDKS alerts]"))
+    text = render(D, a.days, "ALERT ROOT-CAUSE REPORT  last %d day(s)  %s\nWindow: %s  ->  %s   |   generated %s" % (
+        a.days, "" if a.all_alerts else "[PDKS alerts]", tstamp(us(since)), tstamp(us(now)), tstamp(time.time(), False)))
     print(text)
     p = save_report(text, "analyze", D, a.days)
     log("\nsaved: %s  (+ one msg-*.txt per app-team message in the same folder)" % p)
@@ -976,8 +1003,9 @@ def watch(a):
             log("cooldown: %s" % key); continue
         log("diagnosing %s on %s (%d in %dh) ..." % (al, cl, recent[(al, cl)], a.window_hours))
         d = diagnose(al, cl, [r for r in allR if (r["alert"], r["cluster"]) == (al, cl)], a.history_days, a.nodes)
-        text = render([d], a.history_days, "REPEATING ALERT  %s on %s  fired %d times in the last %dh" % (
-            al, cl, recent[(al, cl)], a.window_hours))
+        text = render([d], a.history_days, "REPEATING ALERT  %s on %s  fired %d times in the last %dh\n"
+                      "Window: %s  ->  %s   |   generated %s" % (
+            al, cl, recent[(al, cl)], a.window_hours, tstamp(since), tstamp(us(now)), tstamp(time.time(), False)))
         print(text + "\n")
         save_report(text, "watch-" + cl, [d], a.history_days)
         posted = slack(":rotating_light: Repeating alert (%dx in %dh)\n" % (recent[(al, cl)], a.window_hours) + slack_detail(d))
@@ -1001,6 +1029,307 @@ def drill_cmd(a):
     print("\n".join(E["lines"]))
     for f in E["findings"]:
         print("\n* " + f["problem"] + "\n  " + f["evidence"] + ("\n" + f["yaml"] if f["yaml"] else ""))
+
+# ---------------------------------------------------------------- capacity (disk / PVC / Portworx) + prediction
+import hashlib
+
+NODE_MOUNTS = '/|/var/lib/(kubelet|containerd|docker)'
+
+def fmt_eta(h):
+    if h is None:
+        return "-"
+    if h < 1:
+        return "<1h"
+    if h < 48:
+        return "%.1fh" % h
+    return "%.1fd" % (h / 24)
+
+def eta_s(cur, eta):
+    return "FULL NOW" if cur >= 99 else fmt_eta(eta)
+
+def severity(cur, eta):
+    if cur >= 95 or (eta is not None and eta < 6):
+        return "CRITICAL"
+    if cur >= 85 or (eta is not None and eta < 24):
+        return "HIGH"
+    if eta is not None and eta < 72:
+        return "WATCH"
+    return None
+
+def promnow(expr):
+    return prom(expr, time.time())
+
+def series_map(res, keys):
+    out = {}
+    for x in res:
+        try:
+            out[tuple(x["metric"].get(k, "") for k in keys)] = float(x["value"][1])
+        except (KeyError, ValueError):
+            pass
+    return out
+
+def eta_query(sel, keys, window="6h"):
+    by = ", ".join(keys)
+    return ('((100 - max by (%s) (sysdig_fs_used_percent{%s})) / '
+            '(max by (%s) (deriv(sysdig_fs_used_percent{%s}[%s])) * 3600)) > 0' % (by, sel, by, sel, window))
+
+# ---- node disks ------------------------------------------------------------
+def node_disk_risks(cluster_filter=""):
+    keys = ["agent_tag_cluster", "host_hostname", "fs_mount_dir"]
+    sel = 'fs_mount_dir=~"%s"%s' % (NODE_MOUNTS, (',agent_tag_cluster=~"%s"' % cluster_filter) if cluster_filter else "")
+    cur = series_map(promnow('max by (%s) (sysdig_fs_used_percent{%s}) >= 70' % (", ".join(keys), sel)), keys)
+    eta = series_map(promnow(eta_query(sel, keys) + " < 72"), keys)
+    allcur = series_map(promnow('max by (%s) (sysdig_fs_used_percent{%s})' % (", ".join(keys), sel)), keys) if eta else {}
+    nodes = {}
+    for k in set(cur) | set(eta):
+        cl, host, mnt = k
+        c = cur.get(k, allcur.get(k, 0.0))
+        e = eta.get(k)
+        n = nodes.setdefault((cl, host), {"cluster": cl, "node": host, "cur": 0.0, "eta": None, "mounts": set()})
+        n["mounts"].add(mnt)
+        n["cur"] = max(n["cur"], c)
+        if e is not None and (n["eta"] is None or e < n["eta"]):
+            n["eta"] = e
+    out = []
+    for n in nodes.values():
+        s = severity(n["cur"], n["eta"])
+        if s:
+            n["sev"] = s
+            out.append(n)
+    return out
+
+def node_disk_drill(n):
+    """precise breakdown of what fills a node disk: images vs logs vs writable layer vs emptyDir"""
+    F, L = [], []
+    cx = ctx_for(n["cluster"])
+    if not cx:
+        return ["no kubectl context for %s" % n["cluster"]], F
+    K = ["kubectl", "--context", cx]
+    node = n["node"]
+    rc, out, _ = run(K + ["get", "--raw", "/api/v1/nodes/%s/proxy/stats/summary" % node], 45)
+    if rc and not node.endswith(".internal"):
+        node = node + ".internal"
+        rc, out, _ = run(K + ["get", "--raw", "/api/v1/nodes/%s/proxy/stats/summary" % node], 45)
+    if rc:
+        return ["node no longer exists (replaced): prediction only, no breakdown"], F
+    try:
+        s = json.loads(out)
+    except ValueError:
+        return ["stats/summary unreadable"], F
+    fs = (s.get("node") or {}).get("fs") or {}
+    im = ((s.get("node") or {}).get("runtime") or {}).get("imageFs") or {}
+    used, cap = fs.get("usedBytes", 0) or 0, fs.get("capacityBytes", 0) or 0
+    img_used = im.get("usedBytes", 0) or 0
+    G = 2.0 ** 30
+    pods = []
+    for p in s.get("pods") or []:
+        logs = sum(((c.get("logs") or {}).get("usedBytes") or 0) for c in p.get("containers") or [])
+        rootfs = sum(((c.get("rootfs") or {}).get("usedBytes") or 0) for c in p.get("containers") or [])
+        vols = sum((v.get("usedBytes") or 0) for v in p.get("volume") or [] if not v.get("pvcRef"))
+        pr = p.get("podRef") or {}
+        pods.append({"ns": pr.get("namespace", ""), "pod": pr.get("name", ""), "logs": logs, "rootfs": rootfs,
+                     "vols": vols, "tot": logs + rootfs + vols})
+    pods.sort(key=lambda x: -x["tot"])
+    tot_logs = sum(p["logs"] for p in pods); tot_root = sum(p["rootfs"] for p in pods); tot_vols = sum(p["vols"] for p in pods)
+    nj = kjson(K, ["get", "node", node], 45) or {}
+    images = (nj.get("status") or {}).get("images") or []
+    img_sum = sum(i.get("sizeBytes", 0) for i in images)
+    big = sorted(images, key=lambda i: -i.get("sizeBytes", 0))[:3]
+    L.append("disk %.0fGi / %.0fGi used (%.0f%%)" % (used / G, cap / G, 100.0 * used / cap if cap else 0))
+    L.append("breakdown: images %.1fGi (%d images) | container logs %.1fGi | writable layers %.1fGi | emptyDir %.1fGi" % (
+        (img_used or img_sum) / G, len(images), tot_logs / G, tot_root / G, tot_vols / G))
+    if big:
+        L.append("largest images: " + ", ".join("%s %.1fGi" % ((i.get("names") or ["?"])[-1].split("@")[0][-60:], i.get("sizeBytes", 0) / G) for i in big))
+    for p in pods[:5]:
+        if p["tot"] >= 0.5 * G:
+            L.append("  pod %-50s %5.1fGi  (logs %.1f, writable %.1f, emptyDir %.1f)" % (
+                (p["ns"] + "/" + p["pod"])[:50], p["tot"] / G, p["logs"] / G, p["rootfs"] / G, p["vols"] / G))
+    imgs = img_used or img_sum
+    base = max(used, 1)
+    top = pods[0] if pods else None
+    if top and top["tot"] >= max(3 * G, 0.25 * base):
+        part = max(("logs", top["logs"]), ("rootfs", top["rootfs"]), ("vols", top["vols"]), key=lambda kv: kv[1])[0]
+        why = {"logs": ("writes %.1fGi of container logs (stdout) on the node" % (top["logs"] / G),
+                        "reduce log verbosity / stop logging payloads; kubelet rotates at containerLogMaxSize, so huge logs mean very chatty output"),
+               "rootfs": ("writes %.1fGi inside its container filesystem (not a volume)" % (top["rootfs"] / G),
+                          "write data/temp files to a mounted volume (PVC or sized emptyDir), not the container filesystem"),
+               "vols": ("fills %.1fGi of emptyDir scratch space" % (top["vols"] / G),
+                        "set emptyDir sizeLimit and ephemeral-storage limits, or move the data to a PVC")}[part]
+        F.append({"owner": "platform" if PLATFORM_NS.match(top["ns"]) else "app", "ns": top["ns"], "workload": "pod " + top["pod"],
+                  "problem": "Pod %s/%s %s: %.0f%% of the node's used disk." % (top["ns"], top["pod"], why[0], 100.0 * top["tot"] / base),
+                  "evidence": "kubelet stats/summary per-container logs/rootfs/volume usage on %s." % node,
+                  "yaml": "resources:\n  requests:\n    ephemeral-storage: 2Gi\n  limits:\n    ephemeral-storage: 6Gi\n# %s" % why[1],
+                  "impact": "node hits DiskPressure and the kubelet evicts pods, including other teams'."})
+    if imgs >= 0.5 * base:
+        F.append({"owner": "platform", "ns": "", "workload": "node " + node,
+                  "problem": "Container images use %.0fGi (%.0f%% of used disk, %d images): the root volume is too small for this cluster's image mix." % (
+                      imgs / G, 100.0 * imgs / base, len(images)),
+                  "evidence": "imageFs usage and node image list; largest: %s." % ", ".join(
+                      "%.1fGi" % (i.get("sizeBytes", 0) / G) for i in big),
+                  "yaml": "# EC2NodeClass / launch template: raise root volume, e.g.\nblockDeviceMappings:\n- deviceName: /dev/xvda\n  ebs: {volumeSize: 150Gi, volumeType: gp3}\n"
+                          "# and/or kubelet: imageGCHighThresholdPercent: 75, imageGCLowThresholdPercent: 60",
+                  "impact": "repeated Disk pressure alerts and image pulls failing on this nodepool."})
+    if not F:
+        F.append({"owner": "platform", "ns": "", "workload": "node " + node,
+                  "problem": "Disk filled by a mix of images (%.0fGi), logs (%.0fGi) and pod data (%.0fGi); no single dominant consumer." % (
+                      imgs / G, tot_logs / G, (tot_root + tot_vols) / G),
+                  "evidence": "kubelet stats/summary.", "yaml": "", "impact": "sizing: the root volume is small for this workload mix."})
+    return L, F
+
+# ---- EBS PVCs ----------------------------------------------------------------
+def pvc_risks(cluster_filter=""):
+    keys = ["agent_tag_cluster", "fs_mount_dir"]
+    sel = 'fs_mount_dir=~".*/globalmount"%s' % ((',agent_tag_cluster=~"%s"' % cluster_filter) if cluster_filter else "")
+    cur = series_map(promnow('max by (%s) (sysdig_fs_used_percent{%s}) >= 80' % (", ".join(keys), sel)), keys)
+    eta = series_map(promnow(eta_query(sel, keys, "24h") + " < 168"), keys)
+    allcur = series_map(promnow('max by (%s) (sysdig_fs_used_percent{%s})' % (", ".join(keys), sel)), keys) if eta else {}
+    out = []
+    for k in set(cur) | set(eta):
+        c, e = cur.get(k, allcur.get(k, 0.0)), eta.get(k)
+        s = severity(c, e) or ("WATCH" if e is not None and e < 168 else None)
+        if s:
+            out.append({"cluster": k[0], "mount": k[1], "cur": c, "eta": e, "sev": s})
+    return out
+
+def pvc_resolve(cluster, mounts):
+    """map .../<driver>/<sha256(volumeHandle)>/globalmount -> namespace/pvc via the PV list"""
+    cx = ctx_for(cluster)
+    if not cx:
+        return {}
+    K = ["kubectl", "--context", cx]
+    pv = kjson(K, ["get", "pv"], 60) or {"items": []}
+    sc = kjson(K, ["get", "storageclass"], 30) or {"items": []}
+    expand = {x["metadata"]["name"]: bool(x.get("allowVolumeExpansion")) for x in sc["items"]}
+    idx = {}
+    for p in pv["items"]:
+        csi = (p.get("spec") or {}).get("csi") or {}
+        h = csi.get("volumeHandle")
+        if not h:
+            continue
+        cr = (p.get("spec") or {}).get("claimRef") or {}
+        info = {"pv": p["metadata"]["name"], "ns": cr.get("namespace", ""), "pvc": cr.get("name", ""),
+                "size": ((p.get("spec") or {}).get("capacity") or {}).get("storage", "?"),
+                "sc": (p.get("spec") or {}).get("storageClassName", ""), "vol": h}
+        info["expandable"] = expand.get(info["sc"], False)
+        idx[hashlib.sha256(h.encode()).hexdigest()] = info
+        idx[p["metadata"]["name"]] = info
+    out = {}
+    for m in mounts:
+        parts = m.rstrip("/").split("/")
+        key = parts[-2] if len(parts) >= 2 else ""
+        if key in idx:
+            out[m] = idx[key]
+    return out
+
+# ---- Portworx ------------------------------------------------------------------
+def px_risks():
+    use = prom('100 - (px_pool_stats_available_bytes / px_pool_stats_total_bytes * 100)', time.time())
+    eta = prom('(px_pool_stats_available_bytes / (-deriv(px_pool_stats_available_bytes[24h]))) / 3600 > 0', time.time())
+    def k(x):
+        m = x["metric"]
+        return (m.get("kube_cluster_name") or m.get("agent_tag_cluster", ""), m.get("host_hostname", ""), m.get("kube_pod_name", ""),
+                m.get("pool", m.get("poolid", "")))
+    E = {k(x): float(x["value"][1]) for x in eta}
+    pools = []
+    for x in use:
+        kk = k(x)
+        pools.append({"cluster": kk[0], "node": kk[1], "pod": kk[2], "pool": kk[3], "cur": float(x["value"][1]), "eta": E.get(kk)})
+    vols = []
+    for x in prom('topk(10, delta(px_volume_usage_bytes[7d]))', time.time()):
+        m = x["metric"]
+        name = next((m[k_] for k_ in ("pvc", "volumename", "volume_name", "persistentvolumeclaim", "volumeid", "name") if m.get(k_)), "?")
+        vols.append({"cluster": m.get("kube_cluster_name") or m.get("agent_tag_cluster", ""), "vol": name,
+                     "ns": m.get("namespace", m.get("kube_namespace_name", "")), "grow": float(x["value"][1])})
+    return pools, vols
+
+# ---- report ----------------------------------------------------------------------
+def capacity(a):
+    t0 = time.time()
+    G = 2.0 ** 30
+    log("scanning node disks, PVCs and Portworx pools across the fleet ...")
+    nodes = sorted(node_disk_risks(a.cluster), key=lambda n: (n["eta"] if n["eta"] is not None else 1e9, -n["cur"]))
+    pvcs = sorted(pvc_risks(a.cluster), key=lambda n: (n["eta"] if n["eta"] is not None else 1e9, -n["cur"]))
+    pools, vols = px_risks()
+    drill = nodes[:a.max_drill]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        res = list(ex.map(node_disk_drill, drill))
+    by_cl = defaultdict(list)
+    for p in pvcs:
+        by_cl[p["cluster"]].append(p["mount"])
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        maps = dict(zip(by_cl.keys(), ex.map(lambda cl: pvc_resolve(cl, by_cl[cl]), by_cl.keys())))
+    for p in pvcs:
+        p["info"] = maps.get(p["cluster"], {}).get(p["mount"])
+
+    L = ["CAPACITY RISK REPORT  (%s)  disk + PVC + Portworx, with time-until-full" % datetime.now().strftime("%d %b %Y %H:%M %Z"),
+         "=" * 110, "",
+         "Severity: CRITICAL = >=95% full or full in <6h | HIGH = >=85% or <24h | WATCH = full in <3 days (PVC: <7 days)", ""]
+    L.append("NODE DISKS (%d at risk)" % len(nodes))
+    L.append("  %-9s %-26s %-44s %6s %8s" % ("SEVERITY", "CLUSTER", "NODE", "USED", "FULL IN"))
+    for n in nodes[:25]:
+        L.append("  %-9s %-26s %-44s %5.0f%% %8s" % (n["sev"], n["cluster"][:26], n["node"][:44], n["cur"], eta_s(n["cur"], n["eta"])))
+    L.append("")
+    L.append("PERSISTENT VOLUMES / EBS PVCs (%d at risk)" % len(pvcs))
+    L.append("  %-9s %-24s %-48s %6s %8s  %s" % ("SEVERITY", "CLUSTER", "NAMESPACE/PVC", "USED", "FULL IN", "SIZE / EXPANDABLE"))
+    for p in pvcs[:25]:
+        i = p.get("info") or {}
+        L.append("  %-9s %-24s %-48s %5.0f%% %8s  %s" % (p["sev"], p["cluster"][:24],
+                 ("%s/%s" % (i["ns"], i["pvc"]) if i else "(unmapped) " + p["mount"].split("/")[-2][:12])[:48],
+                 p["cur"], eta_s(p["cur"], p["eta"]), ("%s / %s" % (i.get("size"), "yes" if i.get("expandable") else "NO")) if i else "-"))
+    L.append("")
+    L.append("PORTWORX POOLS (%d pools on %d clusters)" % (len(pools), len({p["cluster"] for p in pools})))
+    for p in sorted(pools, key=lambda p: -p["cur"])[:12]:
+        L.append("  %-26s %-40s %5.0f%% used  full in %s" % (p["cluster"][:26], (p["node"] or p["pod"])[:40], p["cur"], fmt_eta(p["eta"])))
+    if vols:
+        L.append("  fastest-growing Portworx volumes (7 days):")
+        for v in vols[:5]:
+            if v["grow"] > 0:
+                L.append("    +%6.1fGi  %-24s %s" % (v["grow"] / G, v["cluster"][:24], (v["ns"] + "/" if v["ns"] else "") + v["vol"]))
+    L += ["", "", "ROOT CAUSE PER AT-RISK NODE (top %d)" % len(drill), "=" * 110]
+    msgs = []
+    for n, (lines, F) in zip(drill, res):
+        L += ["", "[%s] %s / %s  used %.0f%%, full in %s" % (n["sev"], n["cluster"], n["node"], n["cur"], eta_s(n["cur"], n["eta"]))]
+        L += ["  " + l for l in lines]
+        for f in F:
+            L.append("  WHY: %s  (owner: %s)" % (f["problem"], f["owner"]))
+            if f["owner"] == "app":
+                msgs.append(({"alert": "Node disk filling up", "cluster": n["cluster"], "count": 1, "predictive": True,
+                              "pexp": "Node %s disk is %.0f%% used and will be full in %s at the current write rate." % (
+                                  n["node"], n["cur"], eta_s(n["cur"], n["eta"]))}, f))
+    for p in pvcs:
+        i = p.get("info")
+        if i and p["sev"] in ("CRITICAL", "HIGH"):
+            msgs.append(({"alert": "Persistent volume nearly full", "cluster": p["cluster"], "count": 1, "predictive": True,
+                          "pexp": "PVC %s/%s (%s) is %.0f%% used%s." % (i["ns"], i["pvc"], i["size"], p["cur"],
+                                  " and already FULL" if p["cur"] >= 99 else ", full in %s at the current write rate" % fmt_eta(p["eta"]))},
+                         {"owner": "app", "ns": i["ns"], "workload": "PVC " + i["pvc"],
+                          "problem": "PVC %s in %s is %.0f%% full%s." % (i["pvc"], i["ns"], p["cur"],
+                                     ": writes are already failing or about to" if p["cur"] >= 99 else
+                                     ("" if p["eta"] is None else ", full in %s at the current write rate" % fmt_eta(p["eta"]))),
+                          "evidence": "Sysdig filesystem usage of the EBS volume %s." % i["vol"],
+                          "yaml": ("# StorageClass %s allows expansion: raise spec.resources.requests.storage on the PVC, e.g.\n"
+                                   "kubectl -n %s patch pvc %s -p '{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"<bigger>\"}}}}'" % (i["sc"], i["ns"], i["pvc"]))
+                                  if i.get("expandable") else "# StorageClass %s does NOT allow expansion: clean up/rotate data, or migrate to a larger volume" % i["sc"],
+                          "impact": "writes fail when the volume reaches 100%; the application errors or crashes."}))
+    if msgs:
+        L += ["", "", "MESSAGES READY TO SEND TO APP TEAMS", "=" * 110, ""]
+        for d, f in msgs:
+            L += [app_message(d, f, 1), "", "-" * 110, ""]
+    text = "\n".join(L)
+    print(text)
+    rd = os.path.join(DATA, "reports"); os.makedirs(rd, exist_ok=True)
+    pth = os.path.join(rd, "capacity-%s.txt" % datetime.now().strftime("%Y%m%d-%H%M"))
+    with open(pth, "w") as fh:
+        fh.write(text)
+    os.chmod(pth, 0o600)
+    log("\nsaved %s  (%.0fs)" % (pth, time.time() - t0))
+    crit = [n for n in nodes if n["sev"] == "CRITICAL"] + [p for p in pvcs if p["sev"] == "CRITICAL"]
+    if crit or a.always_notify:
+        slack("*Capacity risk*: %d node disks, %d PVCs at risk (%d critical)\n" % (len(nodes), len(pvcs), len(crit)) + "\n".join(
+            "`%s` %s %s %.0f%% full in %s" % (x["sev"], x["cluster"], x.get("node") or ((x.get("info") or {}).get("pvc") or "pvc"),
+                                               x["cur"], fmt_eta(x["eta"])) for x in (nodes + pvcs)[:15]))
+        if a.mail_to:
+            mail(a.mail_to, "Capacity risk: %d critical, %d node disks / %d PVCs at risk" % (len(crit), len(nodes), len(pvcs)), text)
 
 # ---------------------------------------------------------------- main
 def main():
@@ -1029,6 +1358,11 @@ def main():
     x.add_argument("--mail-to")
     d = sub.add_parser("drill", help="inspect one node by hand")
     d.add_argument("--cluster", required=True); d.add_argument("--node", required=True); d.add_argument("--alert", default="")
+    cp_ = sub.add_parser("capacity", help="disk / PVC / Portworx risk with time-until-full and precise root cause")
+    cp_.add_argument("--cluster", default="", help="regex on cluster name (default: whole fleet)")
+    cp_.add_argument("--max-drill", type=int, default=15, help="at-risk nodes to break down via kubectl")
+    cp_.add_argument("--always-notify", action="store_true", help="Slack/mail even when nothing is CRITICAL")
+    cp_.add_argument("--mail-to")
     co = sub.add_parser("collect")
     co.add_argument("--days", type=int, default=3)
     a = ap.parse_args()
@@ -1043,6 +1377,8 @@ def main():
         watch(a)
     elif a.cmd == "analyze":
         analyze(a)
+    elif a.cmd == "capacity":
+        capacity(a)
     elif a.cmd == "collect":
         n = sync(db(), date.today() - timedelta(days=a.days), date.today())
         log("stored %d notifications -> %s" % (n, DB))
