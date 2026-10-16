@@ -397,7 +397,7 @@ def k8s_time(s):
     except (TypeError, ValueError):
         return 0
 
-PLATFORM_NS = re.compile(r"^(artifactory|jfrog|xray|kube-|sysdig|dynatrace|portworx|karpenter|cattle|amazon-|aws-|cert-manager|ingress|istio|calico|tigera|monitoring|logging|fleet-)")
+PLATFORM_NS = re.compile(r"^(pdks-|artifactory|jfrog|xray|kube-|sysdig|dynatrace|portworx|karpenter|cattle|amazon-|aws-|cert-manager|ingress|istio|calico|tigera|monitoring|logging|fleet-)")
 
 def classify(ts, days, now_us, over_now=None):
     """pattern of a group of alert timestamps -> (label, explanation)"""
@@ -1422,9 +1422,25 @@ R_MEM = 'kube_pod_container_resource_requests{resource="memory"}'
 U_CPU = "sysdig_container_cpu_cores_used"
 R_CPU = 'kube_pod_container_resource_requests{resource="cpu"}'
 
+def _sel(metric, sel):
+    return metric if not sel else (metric[:-1] + "," + sel + "}" if metric.endswith("}") else metric + "{" + sel + "}")
+
+RUN_ON = "agent_tag_cluster, kube_namespace_name, kube_pod_name"
+
 def s(metric, sel="", by=PK):
-    m = metric if not sel else (metric[:-1] + "," + sel + "}" if metric.endswith("}") else metric + "{" + sel + "}")
-    return "sum by (%s) (%s)" % (by, m)
+    """per-pod sum. Usage metrics: max per container first (a restarted container leaves several series).
+    kube-state-metrics requests/limits: Running pods only (completed Job pods keep their request series)."""
+    m = _sel(metric, sel)
+    if metric.startswith("kube_pod_container_resource"):
+        return ("(sum by (%s) (%s) and on (%s) (max by (%s) (kube_pod_status_phase{phase=\"Running\"%s}) == 1))"
+                % (by, m, RUN_ON, RUN_ON, ("," + sel) if sel else ""))
+    return "sum by (%s) (max by (%s, container_name) (%s))" % (by, by, m)
+
+def s_fn(fn, metric, rng, sel="", by=PK):
+    """per-pod sum of a range function, deduped per container"""
+    return "sum by (%s) (max by (%s, container_name) (%s(%s[%s])))" % (by, by, fn, _sel(metric, sel), rng)
+
+BATCH_WL = re.compile(r"(^|-)exec-\d+$|spark|-driver$|(^|-)job(-|$)|airflow-worker|celery")
 
 def memory_scan(cf):
     sel = ('agent_tag_cluster=~"%s"' % cf) if cf else ""
@@ -1444,16 +1460,24 @@ def memory_scan(cf):
     R["oom"].sort(key=lambda r: -r["restarts"])
     # 2. predicted OOM: near limit, steadily growing, pod older than 24h
     use = s(U_MEM, sel); l_ = s(L_MEM, sel)
-    eta = ("((%s - %s) / (sum by (%s) (deriv(%s[24h])) * 3600)) < 72 and on (%s) (%s / %s > 0.6) "
-           "and on (%s) (sum by (%s) (deriv(%s[6h])) > 0) and on (%s) (sum by (%s) (%s offset 24h))") % (
-        l_, use, PK, U_MEM + (("{%s}" % sel) if sel else ""), PK, use, l_,
-        PK, PK, U_MEM + (("{%s}" % sel) if sel else ""), PK, PK, U_MEM + (("{%s}" % sel) if sel else ""))
-    R["leak"] = sorted(pv(pq("(%s) > 0" % eta), keys), key=lambda r: r["v"])
-    cur = kmap(pv(pq(use), keys), keys) if R["leak"] else {}
-    for r in R["leak"]:
+    eta = ("((%s - %s) / (%s * 3600)) < 72 and on (%s) ((%s / %s) > 0.6 < 0.97) "
+           "and on (%s) (%s > 0) and on (%s) (sum by (%s) (%s offset 24h))") % (
+        l_, use, s_fn("deriv", U_MEM, "24h", sel), PK, use, l_,
+        PK, s_fn("deriv", U_MEM, "6h", sel), PK, PK, _sel(U_MEM, sel))
+    cur = kmap(pv(pq(use), keys), keys)
+    R["leak"] = []
+    for r in sorted(pv(pq("(%s) > 0" % eta), keys), key=lambda r: r["v"]):
         k = tuple(r[x] for x in keys); r["used"] = cur.get(k); r["limit"] = lim.get(k)
+        if r["used"] and r["limit"] and not BATCH_WL.search(r["kube_workload_name"] or r["kube_pod_name"]):
+            R["leak"].append(r)
+    R["atlim"] = []
+    for r in sorted(pv(pq("topk(40, (%s / %s) >= 0.97)" % (use, l_)), keys), key=lambda r: -r["v"]):
+        if not BATCH_WL.search(r["kube_workload_name"] or r["kube_pod_name"]):
+            k = tuple(r[x] for x in keys); r["used"] = cur.get(k); r["limit"] = lim.get(k)
+            R["atlim"].append(r)
     # 3. far above request (overcommit offenders)
-    hog = "topk(25, (%s / %s) > 2 and on (%s) (%s > 1073741824))" % (use, s(R_MEM, sel), PK, use)
+    hog = "topk(25, (%s / (%s > 1048576)) > 2 and on (%s) (%s > 1073741824))" % (use, s(R_MEM, sel), PK, use)
+    R["noreq"] = pv(pq("topk(15, (%s > 2147483648) unless on (%s) (%s > 1048576))" % (use, PK, s(R_MEM, sel))), keys)
     R["hog"] = pv(pq(hog), keys)
     req = kmap(pv(pq(s(R_MEM, sel)), keys), keys) if R["hog"] else {}
     curu = kmap(pv(pq(use), keys), keys) if R["hog"] else {}
@@ -1473,8 +1497,12 @@ def memory_scan(cf):
     psel = 'kube_namespace_name=~"%s"' % PLAT_RX + ("," + sel if sel else "")
     med_u = kmap(pv(pq("quantile by (kube_namespace_name, kube_workload_name) (0.5, %s)" % s(U_MEM, psel)), wk), wk)
     med_r = kmap(pv(pq("quantile by (kube_namespace_name, kube_workload_name) (0.5, %s)" % s(R_MEM, psel)), wk), wk)
+    p95_u = kmap(pv(pq("quantile by (kube_namespace_name, kube_workload_name) (0.95, %s)" % s(U_MEM, psel)), wk), wk)
+    max_u = kmap(pv(pq("max by (kube_namespace_name, kube_workload_name) (%s)" % s_fn("max_over_time", U_MEM, "24h", psel)), wk), wk)
+    med_l = kmap(pv(pq("quantile by (kube_namespace_name, kube_workload_name) (0.5, %s)" % s(L_MEM, psel)), wk), wk)
     over = kmap(pv(pq("count by (kube_namespace_name, kube_workload_name) ((%s / %s) > 2)" % (s(U_MEM, psel), s(R_MEM, psel))), wk), wk)
-    R["plat"] = sorted(({"ns": k[0], "wl": k[1], "med_u": med_u[k], "med_r": med_r.get(k), "pods_over": over.get(k, 0)}
+    R["plat"] = sorted(({"ns": k[0], "wl": k[1], "med_u": med_u[k], "med_r": med_r.get(k), "pods_over": over.get(k, 0),
+                         "p95_u": p95_u.get(k, med_u[k]), "max_u": max_u.get(k, med_u[k]), "lim": med_l.get(k)}
                         for k in med_u if med_r.get(k) and med_u[k] > 2 * med_r[k] and over.get(k, 0) >= 5),
                        key=lambda r: -r["pods_over"])
     return R
@@ -1485,12 +1513,13 @@ def cpu_scan(cf):
     sq = lambda m: m + (("{%s}" % sel) if sel else "")
     R = {}
     # 1. throttled: at the CPU limit for the last hour
-    R["thr"] = sorted(pv(pq("topk(25, max by (%s) (avg_over_time(%s[1h])) >= 90)" % (PK, sq("sysdig_container_cpu_quota_used_percent"))), keys),
+    R["thr"] = sorted(pv(pq("topk(25, max by (%s) (avg_over_time(%s[1h])) >= 90 <= 150)" % (PK, sq("sysdig_container_cpu_quota_used_percent"))), keys),
                       key=lambda r: -r["v"])
     # 2. under-requested: hourly avg usage > 2x request and > 0.5 core
-    use = "sum by (%s) (avg_over_time(%s[1h]))" % (PK, sq(U_CPU))
+    use = s_fn("avg_over_time", U_CPU, "1h", sel)
     req = s(R_CPU, sel)
-    R["under"] = pv(pq("topk(25, (%s / %s) > 2 and on (%s) (%s > 0.5))" % (use, req, PK, use)), keys)
+    R["under"] = pv(pq("topk(25, (%s / (%s > 0.01)) > 2 and on (%s) (%s > 0.5))" % (use, req, PK, use)), keys)
+    R["noreq_cpu"] = pv(pq("topk(15, (%s > 1) unless on (%s) (%s > 0.01))" % (use, PK, req)), keys)
     u_m = kmap(pv(pq(use), keys), keys) if R["under"] else {}
     r_m = kmap(pv(pq(req), keys), keys) if R["under"] else {}
     for r in R["under"]:
@@ -1498,14 +1527,15 @@ def cpu_scan(cf):
     R["under"].sort(key=lambda r: -(r.get("used") or 0))
     # 3. bin-packing: a single pod's p95 needs > 60% of its node
     nk = keys + ["kube_node_name"]
-    p95 = "sum by (%s, kube_node_name) (quantile_over_time(0.95, %s[24h]))" % (PK, sq(U_CPU))
+    p95 = "sum by (%s, kube_node_name) (max by (%s, kube_node_name, container_name) (quantile_over_time(0.95, %s[24h])))" % (PK, PK, sq(U_CPU))
     R["bin"] = pv(pq("topk(20, (%s / on (agent_tag_cluster, kube_node_name) group_left max by (agent_tag_cluster, kube_node_name) "
-                     "(kube_node_status_allocatable{resource=\"cpu\"%s})) > 0.6)" % (p95, ("," + sel) if sel else "")), nk)
+                     "(kube_node_status_allocatable{resource=\"cpu\"%s})) > 0.6 <= 1.2)" % (p95, ("," + sel) if sel else "")), nk)
     # 4. waste: requested but unused (24h avg), per cluster
-    use24 = "sum by (%s) (avg_over_time(%s[24h]))" % (PK, sq(U_CPU))
+    use24 = s_fn("avg_over_time", U_CPU, "24h", sel)
     R["waste_cl"] = sorted(pv(pq("topk(15, sum by (agent_tag_cluster) ((%s - %s) > 0.5))" % (req, use24)), ["agent_tag_cluster"]),
                            key=lambda r: -r["v"])
-    R["waste"] = pv(pq("topk(15, (%s - %s) > 2)" % (req, use24)), keys)
+    wk3 = ["agent_tag_cluster", "kube_namespace_name", "kube_workload_name"]
+    R["waste"] = pv(pq("topk(15, sum by (agent_tag_cluster, kube_namespace_name, kube_workload_name) ((%s - %s) > 0.5) > 2)" % (req, use24)), wk3)
     return R
 
 def resources(a):
@@ -1529,7 +1559,12 @@ def resources(a):
                 r["agent_tag_cluster"][:24], wl(r)[:55], r["restarts"], fmt_b(r["limit"]) if r.get("limit") else "NONE",
                 fmt_b(r["peak"]) if r.get("peak") else "?", who(r["kube_namespace_name"])))
         L.append("")
-        L.append("PREDICTED OOM: steady growth, will hit its limit within 3 days (%d)" % len(M["leak"]))
+        L.append("AT ITS MEMORY LIMIT NOW: >=97%% of limit, next allocation spike = OOM kill (batch/Spark excluded) (%d)" % len(M["atlim"]))
+        for r in M["atlim"][:12]:
+            L.append("  %-24s %-55s %s of %s  [%s]" % (r["agent_tag_cluster"][:24], wl(r)[:55], fmt_b(r.get("used") or 0),
+                                                      fmt_b(r.get("limit") or 0), who(r["kube_namespace_name"])))
+        L.append("")
+        L.append("PREDICTED OOM: long-running pod growing steadily, hits its limit within 3 days (batch/Spark excluded) (%d)" % len(M["leak"]))
         for r in M["leak"][:15]:
             L.append("  %-24s %-55s %s of %s, OOM in %s  [%s]" % (
                 r["agent_tag_cluster"][:24], wl(r)[:55], fmt_b(r.get("used") or 0), fmt_b(r.get("limit") or 0), fmt_eta(r["v"]), who(r["kube_namespace_name"])))
@@ -1537,8 +1572,12 @@ def resources(a):
         L.append("FAR ABOVE REQUEST: >2x request and >1Gi (these overcommit nodes and trigger Memory critical) (%d)" % len(M["hog"]))
         for r in M["hog"][:15]:
             L.append("  %-24s %-55s uses %-8s request %-8s (%.1fx) limit %s  [%s]" % (
-                r["agent_tag_cluster"][:24], wl(r)[:55], fmt_b(r.get("used") or 0), fmt_b(r.get("req") or 0), r["v"],
+                r["agent_tag_cluster"][:24], wl(r)[:55], fmt_b(r.get("used") or 0), fmt_b(r["req"]) if r.get("req") else "?", r["v"],
                 fmt_b(r["limit"]) if r.get("limit") else "NONE", who(r["kube_namespace_name"])))
+        L.append("")
+        L.append("NO MEMORY REQUEST, using >2Gi (invisible to the scheduler) (%d)" % len(M["noreq"]))
+        for r in M["noreq"][:10]:
+            L.append("  %-24s %-55s uses %s with no request  [%s]" % (r["agent_tag_cluster"][:24], wl(r)[:55], fmt_b(r["v"]), who(r["kube_namespace_name"])))
         L.append("")
         L.append("NODES OVERCOMMITTED BY LIMITS (sum of limits > 1.5x node memory) (%d)" % len(M["node"]))
         for r in M["node"][:10]:
@@ -1556,8 +1595,12 @@ def resources(a):
         L.append("")
         L.append("UNDER-REQUESTED: hourly usage >2x request and >0.5 core (causes High CPU on shared nodes) (%d)" % len(C["under"]))
         for r in C["under"][:15]:
-            L.append("  %-24s %-55s uses %.2f cores, request %.2f (%.1fx)  [%s]" % (
-                r["agent_tag_cluster"][:24], wl(r)[:55], r.get("used") or 0, r.get("req") or 0, r["v"], who(r["kube_namespace_name"])))
+            L.append("  %-24s %-55s uses %.2f cores, request %s (%.1fx)  [%s]" % (
+                r["agent_tag_cluster"][:24], wl(r)[:55], r.get("used") or 0, ("%.2f" % r["req"]) if r.get("req") else "?", r["v"], who(r["kube_namespace_name"])))
+        L.append("")
+        L.append("NO CPU REQUEST, using >1 core (%d)" % len(C["noreq_cpu"]))
+        for r in C["noreq_cpu"][:10]:
+            L.append("  %-24s %-55s uses %.2f cores with no request  [%s]" % (r["agent_tag_cluster"][:24], wl(r)[:55], r["v"], who(r["kube_namespace_name"])))
         L.append("")
         L.append("BIN-PACKING: one pod's p95 needs >60%% of its node's CPU (node too small for the pod) (%d)" % len(C["bin"]))
         for r in C["bin"][:10]:
@@ -1567,8 +1610,9 @@ def resources(a):
         L.append("RECLAIMABLE CPU: requested but unused over 24h (top clusters: %.0f cores)" % tot)
         for r in C["waste_cl"][:10]:
             L.append("  %-30s %6.1f cores" % (r["agent_tag_cluster"], r["v"]))
-        for r in C["waste"][:8]:
-            L.append("    biggest: %-24s %-50s %.1f cores unused" % (r["agent_tag_cluster"][:24], wl(r)[:50], r["v"]))
+        for r in sorted(C["waste"], key=lambda r: -r["v"])[:8]:
+            L.append("    biggest: %-24s %-50s %.1f cores unused" % (r["agent_tag_cluster"][:24],
+                     ("%s/%s" % (r["kube_namespace_name"], r["kube_workload_name"]))[:50], r["v"]))
         L.append("")
     # fleet patterns
     L += ["FLEET PATTERNS", "=" * 110]
@@ -1576,10 +1620,12 @@ def resources(a):
     if M and M["plat"]:
         for p in M["plat"][:5]:
             pats += 1
-            L.append("  * %s/%s uses a median %s against a %s request; %d pods across the fleet run at >2x request." % (
-                p["ns"], p["wl"], fmt_b(p["med_u"]), fmt_b(p["med_r"] or 0), p["pods_over"]))
-            L.append("      fix (platform, once in Helm values): resources.requests.memory: %s, limits.memory: %s" % (
-                mmem(p["med_u"] * 1.3), mmem(p["med_u"] * 2)))
+            new_lim = max(p.get("lim") or 0, p["max_u"] * 1.25)
+            L.append("  * %s/%s: median %s, p95 %s, peak %s against a %s request%s; %d pods across the fleet run at >2x request." % (
+                p["ns"], p["wl"], fmt_b(p["med_u"]), fmt_b(p["p95_u"]), fmt_b(p["max_u"]), fmt_b(p["med_r"] or 0),
+                (" and %s limit" % fmt_b(p["lim"])) if p.get("lim") else "", p["pods_over"]))
+            L.append("      fix (platform, once in Helm values): resources.requests.memory: %s (p95), limits.memory: %s (peak +25%%, never below today's limit)" % (
+                mmem(p["p95_u"]), mmem(new_lim)))
     if M and M["oom"]:
         ns_c = Counter(r["kube_namespace_name"] for r in M["oom"])
         for ns_, n_ in ns_c.most_common(3):
